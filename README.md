@@ -3,6 +3,10 @@
 Whole-disk file name search for macOS in C++. Every keystroke searches every
 file and folder on the disk.
 
+Inspired by [Noah's Rust file search engine](https://x.com/itsnoahd/status/2107993727809855570).
+
+The code in this repository is entirely AI-generated.
+
 ## Build
 
 ```sh
@@ -115,3 +119,7 @@ memory pressure and read them back from the cache file.
   changes made while fplussearch is open do not appear until the next launch.
 - Results list folders first, then files, each sorted by name (byte order);
   they are not ranked by relevance.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
