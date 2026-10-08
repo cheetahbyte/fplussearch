@@ -32,8 +32,7 @@ bool load_symbols(SymbolIndex& sx, const std::string& file, const Index& ix);
 
 // Rebuilds the symbol index for `ix`, re-reading only source files whose
 // path, size or modification time changed since the previous one.
-void build_symbols(const Index& ix, const CodeFile* code, size_t code_count, const std::string& file,
-                   ScanProgress* progress, bool background);
+void build_symbols(const Index& ix, const std::string& file, ScanProgress* progress, bool background);
 
 struct SymbolLocation {
   bool found = false;

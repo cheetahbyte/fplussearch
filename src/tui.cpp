@@ -1,5 +1,8 @@
 #include "tui.hpp"
 
+#include "live.hpp"
+#include "search.hpp"
+
 #include <poll.h>
 #include <signal.h>
 #include <sys/ioctl.h>
@@ -7,6 +10,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -155,13 +159,14 @@ constexpr const char* kSelect = "\x1b[48;5;236m";
 class App {
  public:
   App(std::shared_ptr<const Index> ix, Engine& engine, const TuiOptions& opt)
-      : ix_(std::move(ix)), engine_(engine), opt_(opt) {
+      : ix_(std::move(ix)), engine_(engine), opt_(opt), live_({.root = opt.root, .cache_file = opt.cache_file, .scan_threads = opt.scan_threads}, engine) {
     if (const char* h = std::getenv("HOME")) home_ = h;
     if (ix_) sx_ = load(*ix_);
   }
 
   std::string run() {
-    if (!ix_ || opt_.rescan) start_scan();
+    following_ = !ix_ || opt_.rescan;
+    if (following_) live_.start(ix_, [this] { changed_ = true; });
     enter_terminal();
     std::string chosen;
     bool quit = false;
@@ -176,11 +181,11 @@ class App {
         }
         search();
       }
-      if (adopt_scan()) search();
+      if (changed_.exchange(false)) adopt();
       render();
 
       pollfd p{STDIN_FILENO, POLLIN, 0};
-      if (poll(&p, 1, scanning_ ? 100 : 1000) <= 0) continue;
+      if (poll(&p, 1, live_.busy() ? 100 : 50) <= 0) continue;
       char buf[4096];
       ssize_t n = ::read(STDIN_FILENO, buf, sizeof buf);
       if (n <= 0) break;
@@ -207,7 +212,7 @@ class App {
         } else if (c == 0x03 || c == 0x04) {
           quit = true;
         } else if (c == '\r' || c == '\n') {
-          if (ix_ && sel_ < int(res_.top.size())) chosen = selected_path(res_.top[size_t(sel_)]);
+          if (ix_ && sel_ < int(res_.top.size())) chosen = selected_path(size_t(sel_));
           quit = !chosen.empty();
         } else if (c == 0x10) {
           move(-1);
@@ -228,11 +233,11 @@ class App {
       settle();
     }
     restore_terminal();
-    if (scanner_.joinable()) scanner_.detach();
+    if (following_ && !live_.busy()) live_.stop();  // a running scan is abandoned: run_tui exits at once
     return chosen;
   }
 
-  bool scanning() const { return scanning_; }
+  bool scanning() const { return following_ && live_.busy(); }
 
  private:
   std::shared_ptr<const SymbolIndex> load(const Index& ix) const {
@@ -240,33 +245,20 @@ class App {
     return load_symbols(*sx, symbol_file(opt_.cache_file), ix) ? sx : nullptr;
   }
 
-  void start_scan() {
-    scanning_ = true;
-    const bool background = ix_ != nullptr;
-    scanner_ = std::thread([this, background] {
-      auto fresh = std::make_shared<Index>(
-          build_index(opt_.root, opt_.scan_threads, &progress_, background, opt_.cache_file));
-      auto sx = load(*fresh);
-      std::lock_guard lk(scan_m_);
-      scanned_ = std::move(fresh);
-      scanned_sx_ = std::move(sx);
-    });
-  }
-
-  bool adopt_scan() {
-    std::lock_guard lk(scan_m_);
-    if (!scanned_) return false;
-    ix_ = std::move(scanned_);
-    sx_ = std::move(scanned_sx_);
+  // Takes what the live index sees now and searches it again.
+  void adopt() {
+    state_ = live_.state();
+    if (!state_) return;
+    ix_ = state_->ix;
+    sx_ = state_->sx;
     locs_.clear();
-    scanning_ = false;
-    scanner_.join();
-    return true;
+    search();
   }
 
   // Path of a result; for symbols with the definition's line appended.
-  std::string selected_path(uint32_t r) {
-    if (!sym_mode_) return ix_->path(r);
+  std::string selected_path(size_t i) {
+    const uint32_t r = res_.top[i];
+    if (!sym_mode_) return i < res_.extra.size() && res_.extra[i] ? res_.extra[i]->path : ix_->path(r);
     const SymbolLocation& loc = location(r);
     const std::string path = ix_->path(sx_->occ[r]);
     return loc.found ? path + ":" + std::to_string(loc.line) : path;
@@ -283,18 +275,18 @@ class App {
     if (!ix_) return;
     size_t limit = size_t(std::max(1, rows_ - 8));
     auto t0 = std::chrono::steady_clock::now();
-    Query q = parse_query(query_);
+    Query q = parse_query(query_, home_);
     sym_mode_ = !q.syms.empty();
     if (sym_mode_) {
-      res_ = sx_ ? engine_.search_symbols(*ix_, *sx_, q, limit) : Results{};
-    } else if (q.terms.empty() && q.exts.empty() && !q.has_size && q.types == kTypeAny) {
+      res_ = sx_ ? (state_ ? live_.search(*state_, q, limit) : engine_.search_symbols(*ix_, *sx_, q, limit)) : Results{};
+    } else if (!q.selects()) {
       res_ = {};
     } else {
-      res_ = engine_.search(*ix_, q, limit);
+      res_ = state_ ? live_.search(*state_, q, limit) : engine_.search(*ix_, q, limit);
     }
     last_ms_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     error_ = q.error;
-    if (sym_mode_ && !sx_) error_ = scanning_ ? "the symbol index is still being built" : "no symbol index yet";
+    if (sym_mode_ && !sx_) error_ = live_.busy() ? "the symbol index is still being built" : "no symbol index yet";
     sel_ = std::min(sel_, std::max(0, int(res_.top.size()) - 1));
     if (record && !query_.empty()) {
       times_.push_back(last_ms_);
@@ -306,12 +298,13 @@ class App {
     sel_ = std::clamp(sel_ + d, 0, std::max(0, int(res_.top.size()) - 1));
   }
 
-  std::string dir_of(uint32_t e) const {
-    std::string d = ix_->path(ix_->parent(e));
+  std::string tilde(std::string d) const {
     if (!home_.empty() && d.starts_with(home_) && (d.size() == home_.size() || d[home_.size()] == '/'))
       d = "~" + d.substr(home_.size());
     return d;
   }
+
+  std::string dir_of(uint32_t e) const { return tilde(ix_->path(ix_->parent(e))); }
 
   std::string sparkline(size_t width) const {
     static const char* bars[] = {"▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"};
@@ -336,7 +329,8 @@ class App {
     std::string title = std::string(kBold) + "fplussearch" + kReset + kDim + "  ";
     title += opt_.root == "/" ? "whole disk" : printable(opt_.root);
     if (ix_) title += " · " + commas(ix_->count()) + " files and folders";
-    if (scanning_) {
+    if (following_ && live_.busy()) {
+      ScanProgress& progress_ = live_.progress();
       const uint64_t sources = progress_.source_files.load(std::memory_order_relaxed);
       if (sources) {
         title += " · symbols " + commas(sources) + " files";
@@ -380,6 +374,11 @@ class App {
         name = printable(sx_->symbol(e)) + "  " + kDim + (loc.found ? kind_name(loc.kind) : "?") + kReset;
         e = sx_->occ[e];
         dir = printable(dir_of(e) + "/" + ix_->name(e)) + (loc.found ? ":" + std::to_string(loc.line) : "");
+      } else if (const Extra* x = i < res_.extra.size() ? res_.extra[i] : nullptr) {
+        const size_t slash = x->path.rfind('/');
+        name = printable(x->path.substr(slash + 1));
+        if (x->dir) name += "/";
+        dir = printable(tilde(slash == 0 ? "/" : x->path.substr(0, slash)));
       } else {
         name = printable(e == 0 ? ix_->root : ix_->name(e));
         if (ix_->is_dir(e)) name += "/";
@@ -428,12 +427,10 @@ class App {
   bool sym_mode_ = false;
   std::unordered_map<uint32_t, SymbolLocation> locs_;  // per occurrence, for visible rows
 
-  std::thread scanner_;
-  std::mutex scan_m_;
-  std::shared_ptr<const Index> scanned_;
-  std::shared_ptr<const SymbolIndex> scanned_sx_;
-  ScanProgress progress_;
-  bool scanning_ = false;
+  Live live_;
+  bool following_ = false;
+  std::shared_ptr<const Live::State> state_;  // what results refer to
+  std::atomic<bool> changed_{false};
 };
 
 }  // namespace

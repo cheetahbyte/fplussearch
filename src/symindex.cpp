@@ -18,13 +18,13 @@ namespace fplussearch {
 
 namespace {
 
-constexpr char kMagic[8] = {'F', 'S', 'R', 'C', 'H', 'S', 'Y', '1'};
+constexpr char kMagic[8] = {'F', 'S', 'R', 'C', 'H', 'S', 'Y', '2'};
 enum Field : size_t { kNames = 0, kOcc = kSectionFields, kFileFp, kFileEntry, kFields };
 enum Meta : size_t { kMetaBuildId, kMetaFiles };
 
 // Opening and reading 2M small files is bound by kernel and disk latency,
-// not CPU, so many more threads than cores pay off.
-constexpr unsigned kReaders = 32;
+// not CPU, so more threads than cores pay off; past 16 the kernel contends.
+constexpr unsigned kReaders = 16;
 constexpr size_t kFilesPerJob = 256;
 
 bool attach(SymbolIndex& sx, Fields&& f) {
@@ -95,8 +95,9 @@ bool load_symbols(SymbolIndex& sx, const std::string& file, const Index& ix) {
   return true;
 }
 
-void build_symbols(const Index& ix, const CodeFile* code, size_t code_count, const std::string& file,
-                   ScanProgress* progress, bool background) {
+void build_symbols(const Index& ix, const std::string& file, ScanProgress* progress, bool background) {
+  const uint32_t* code = ix.code_entry.p;
+  const size_t code_count = ix.code_entry.n;
   // Fingerprint each source file by path, size and modification time.
   BigVec<uint64_t> dir_hash(ix.dirs, 0);
   const uint64_t root_hash = hash_bytes(0, ix.root) | 1;
@@ -112,8 +113,8 @@ void build_symbols(const Index& ix, const CodeFile* code, size_t code_count, con
   };
   BigVec<uint64_t> fp(code_count);
   for (size_t k = 0; k < code_count; ++k) {
-    const uint32_t e = code[k].entry;
-    fp[k] = mix(mix(hash_bytes(dir_fp(ix.parent(e)), ix.name(e)), ix.size(e)), code[k].mtime);
+    const uint32_t e = code[k];
+    fp[k] = mix(mix(hash_bytes(dir_fp(ix.parent(e)), ix.name(e)), ix.size(e)), ix.code_mtime[k]);
   }
   BigVec<uint64_t>().swap(dir_hash);
 
@@ -131,7 +132,7 @@ void build_symbols(const Index& ix, const CodeFile* code, size_t code_count, con
       const auto it = std::lower_bound(by_fp.begin(), by_fp.end(), std::make_pair(old.file_fp[j], uint32_t(0)));
       if (it == by_fp.end() || it->first != old.file_fp[j]) continue;
       reused[it->second] = 1;
-      old_to_new[old.file_entry[j]] = code[it->second].entry;
+      old_to_new[old.file_entry[j]] = code[it->second];
     }
   }
   auto each_old = [&](auto&& f) {  // f(old name, new entry) for every carried-over definition
@@ -162,7 +163,7 @@ void build_symbols(const Index& ix, const CodeFile* code, size_t code_count, con
           job.counts.push_back(0);
           continue;
         }
-        const uint32_t e = code[k].entry;
+        const uint32_t e = code[k];
         std::string_view src;
         if (!read_file(ix.path(e), ix.size(e), buf, src)) {
           job.counts.push_back(UINT32_MAX);
@@ -214,10 +215,10 @@ void build_symbols(const Index& ix, const CodeFile* code, size_t code_count, con
       size_t at = 0;
       for (uint32_t c : job.counts) {
         if (c != UINT32_MAX) {
-          for (uint32_t i = 0; i < c; ++i) occ[pos[rank[job.ids[at + i]]]++] = code[k].entry;
+          for (uint32_t i = 0; i < c; ++i) occ[pos[rank[job.ids[at + i]]]++] = code[k];
           at += c;
           file_fp.push_back(fp[k]);
-          file_entry.push_back(code[k].entry);
+          file_entry.push_back(code[k]);
         }
         ++k;
       }

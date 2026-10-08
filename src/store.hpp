@@ -111,7 +111,7 @@ Blob blob(BigVec<T>&& v) {
   return {owned, reinterpret_cast<const char*>(owned->data()), owned->size() * sizeof(T)};
 }
 
-constexpr size_t kSectionFields = 6;
+constexpr size_t kSectionFields = 7;
 
 // Lays out names [0, count) as a Section. `first` has count + 1 entries: the
 // first item (entry or occurrence) of each name, then the end.
@@ -137,6 +137,33 @@ struct Fields {
 
 bool save_fields(const std::string& file, const char (&magic)[8], const std::array<uint64_t, 8>& meta,
                  const std::vector<Blob>& fields);
+
+// Writes the same container as save_fields, but field by field and in any
+// order, so a big field can be streamed out instead of held in memory.
+class FieldWriter {
+ public:
+  FieldWriter(std::string file, const char (&magic)[8], size_t count);
+  ~FieldWriter();
+  FieldWriter(const FieldWriter&) = delete;
+  FieldWriter& operator=(const FieldWriter&) = delete;
+
+  bool write(size_t field, const void* data, size_t size);
+  // A field written in pieces: begin, append..., end.
+  bool begin(size_t field);
+  bool append(const void* data, size_t size);
+  void end();
+  // Writes the header and publishes the file; false if anything failed.
+  bool finish(const std::array<uint64_t, 8>& meta);
+
+ private:
+  std::string file_, tmp_;
+  char magic_[8];
+  FILE* f_ = nullptr;
+  std::vector<uint64_t> table_;  // (offset, size) per field
+  uint64_t pos_ = 0;
+  size_t open_ = SIZE_MAX;  // the field being appended to
+  bool ok_ = true;
+};
 bool map_fields(const std::string& file, const char (&magic)[8], size_t count, Fields& out);
 // Serves fields from memory when the cache file cannot be written.
 Fields hold_fields(const std::array<uint64_t, 8>& meta, std::vector<Blob> fields);
@@ -154,6 +181,7 @@ std::array<Blob, kSectionFields> make_section(size_t count, NameAt&& name_at, co
   BigVec<uint16_t> name_off;
   BigVec<uint8_t> counts;
   BigVec<Overflow> overflow;
+  BigVec<uint64_t> mask(count);
   size_t total = kPad;
   for (size_t k = 0; k < count; ++k) {
     const size_t len = name_at(k).size();
@@ -176,6 +204,7 @@ std::array<Blob, kSectionFields> make_section(size_t count, NameAt&& name_at, co
     counts.push_back(uint8_t(std::min<uint32_t>(c, 255)));
     if (c >= 255) overflow.push_back({uint32_t(k), 0, c});
     const std::string_view nm = name_at(k);
+    mask[k] = name_mask(nm);
     if (hex) {
       pack_hex(nm, bytes);
     } else {
@@ -187,7 +216,7 @@ std::array<Blob, kSectionFields> make_section(size_t count, NameAt&& name_at, co
   block_first.push_back(first[count]);
   bytes.resize(bytes.size() + kPad, '\0');
   return {blob(std::move(bytes)), blob(std::move(block_off)), blob(std::move(block_first)),
-          blob(std::move(name_off)), blob(std::move(counts)), blob(std::move(overflow))};
+          blob(std::move(name_off)), blob(std::move(counts)), blob(std::move(overflow)), blob(std::move(mask))};
 }
 
 }  // namespace fplussearch

@@ -37,9 +37,12 @@ and exit, Ctrl-U to clear, Ctrl-W to delete a word, Esc or Ctrl-C to quit.
 The first run indexes the disk and caches the index in
 `~/Library/Caches/fplussearch/`: about 25 s for 6 million entries, plus about
 45 s to read 2 million source files for the symbol index. Later runs map the
-cache in a few milliseconds and refresh it in the background at low priority;
-the refresh only re-reads source files whose path, size or modification time
-changed.
+cache in a few milliseconds. The interactive mode then asks FSEvents which
+folders changed since the cache was written and refreshes the index in the
+background, re-reading only those folders and the source files in them whose
+size or modification time changed: about 2 s for the whole disk instead of a
+full rescan. While it stays open, it applies new changes at most every 30 s.
+A full rescan happens only when FSEvents has lost track of changes.
 
 Give your terminal Full Disk Access to index protected folders such as Mail
 and Messages. Other volumes (`/Volumes`) are not indexed.
@@ -117,6 +120,11 @@ memory pressure and read them back from the cache files.
   how many entries contain each character and character pair, so these
   queries read the total from a table and only scan until the screen is
   full.
+- A refresh rebuilds the index from the previous one: folders FSEvents
+  reported (and folders new to the index) are listed from disk, everything
+  else is copied from the cached index, a whole unchanged subtree at a time.
+  The cache records the FSEvents id it is current to, so the next launch
+  replays only what happened since.
 - Search threads run at interactive priority and spin for 250 ms after each
   search, because an idle core cluster takes milliseconds to ramp back up.
 - Symbols come from a per-language token scanner (comments and strings are
@@ -132,8 +140,9 @@ memory pressure and read them back from the cache files.
 - Case-insensitive matching covers ASCII only. Names are matched byte for
   byte, so an accented character typed in a different Unicode normalization
   form than the file name will not match.
-- The index is a snapshot that is refreshed on each interactive launch;
-  changes made while fplussearch is open do not appear until the next launch.
+- Query mode (`fplussearch QUERY`) and `--bench` use the cache as it is;
+  only the interactive mode refreshes it. While the interactive mode is open,
+  changes can take up to 30 s to appear.
 - Results list folders first, then files, each sorted by name (byte order);
   they are not ranked by relevance.
 - Symbol extraction is heuristic, not a parser: unusual code can be missed or

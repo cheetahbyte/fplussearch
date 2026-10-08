@@ -74,7 +74,8 @@ class Pool {
       // and an idle P-core cluster takes several ms to ramp back up, which is
       // ~10x the cost of a search. Workers sleep once typing pauses.
       const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
-      while (gen_.load(std::memory_order_acquire) == seen && std::chrono::steady_clock::now() < deadline)
+      while (gen_.load(std::memory_order_acquire) == seen && !stop_.load(std::memory_order_relaxed) &&
+             std::chrono::steady_clock::now() < deadline)
         std::this_thread::yield();
       std::shared_ptr<Batch> b;
       {
@@ -93,7 +94,7 @@ class Pool {
   std::condition_variable cv_;
   std::shared_ptr<Batch> batch_;
   std::atomic<uint64_t> gen_{0};
-  bool stop_ = false;
+  std::atomic<bool> stop_{false};
 };
 
 }  // namespace fplussearch
