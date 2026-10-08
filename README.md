@@ -12,9 +12,9 @@ make            # produces build/fplussearch (needs a C++20 compiler)
 ## Usage
 
 ```sh
-build/fplussearch                         # interactive; Enter prints the selected path
-build/fplussearch 'size:>1gb type:video'  # print matches and exit
-build/fplussearch --bench                 # timing table
+build/fplussearch                          # interactive; Enter prints the selected path
+build/fplussearch 'size:>1gb type:video'   # print matches and exit
+build/fplussearch --bench                  # timing table
 ```
 
 | Option | Meaning |
