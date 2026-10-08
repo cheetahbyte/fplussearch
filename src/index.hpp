@@ -84,6 +84,7 @@ struct Index {
   Span<uint32_t> file_size;         // per file; UINT32_MAX = see big_sizes
   Span<Overflow> big_sizes;         // entry -> size, sorted
   Span<uint32_t> grams;             // [dirs, files][gram_slot]: entries whose name contains it
+  uint64_t build_id = 0;  // identifies this build to the symbol index
   std::shared_ptr<const void> backing;
   size_t bytes = 0;
 
@@ -106,11 +107,21 @@ struct Index {
 
 struct ScanProgress {
   std::atomic<uint64_t> entries{0};
+  std::atomic<uint64_t> source_files{0};  // read by the symbol pass; nonzero once it starts
+};
+
+// Source files larger than this are not scanned for symbols.
+constexpr uint64_t kMaxSourceSize = uint64_t(1) << 20;
+
+struct CodeFile {
+  uint32_t entry;
+  uint64_t mtime;  // nanoseconds since the epoch
 };
 
 // Scans `root`, writes the index to `cache_file` and maps it back (or keeps
-// it in memory if the file cannot be written). `background` lowers the scan
-// threads' QoS so they don't compete with search.
+// it in memory if the file cannot be written), then updates the symbol index
+// next to it. `background` lowers the threads' QoS so they don't compete
+// with search.
 Index build_index(const std::string& root, unsigned threads, ScanProgress* progress, bool background,
                   const std::string& cache_file);
 bool load_index(Index& ix, const std::string& file);

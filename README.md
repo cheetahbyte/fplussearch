@@ -1,7 +1,8 @@
 # fplussearch
 
-Whole-disk file name search for macOS in C++. Every keystroke searches every
-file and folder on the disk.
+Whole-disk file name and code symbol search for macOS in C++. Every keystroke
+searches every file and folder on the disk, or every function and type
+defined in its source files.
 
 Inspired by [Noah's Rust file search engine](https://x.com/itsnoahd/status/2107993727809855570).
 
@@ -33,9 +34,12 @@ build/fplussearch --bench                  # timing table
 Interactive keys: arrows or Ctrl-P/Ctrl-N to select, Enter to print the path
 and exit, Ctrl-U to clear, Ctrl-W to delete a word, Esc or Ctrl-C to quit.
 
-The first run indexes the disk (about 25 s for 6 million entries) and caches
-the index in `~/Library/Caches/fplussearch/`. Later runs map the cache in a few
-milliseconds and refresh it in the background at low priority.
+The first run indexes the disk and caches the index in
+`~/Library/Caches/fplussearch/`: about 25 s for 6 million entries, plus about
+45 s to read 2 million source files for the symbol index. Later runs map the
+cache in a few milliseconds and refresh it in the background at low priority;
+the refresh only re-reads source files whose path, size or modification time
+changed.
 
 Give your terminal Full Disk Access to index protected folders such as Mail
 and Messages. Other volumes (`/Volumes`) are not indexed.
@@ -49,8 +53,11 @@ All parts must match. Name matching is a case-insensitive substring match.
 | `report 2024` | Names containing both `report` and `2024` |
 | `"my file"` | Names containing `my file` |
 | `size:>1gb`, `size:<=10mb`, `size:500k` | File size (`>`, `>=`, `<`, `<=`, `=`; bare means `>=`; units b, k, m, g, t, base 1024) |
-| `type:video` | `video`, `audio`, `image`, `doc`, `archive`, `code` by extension, plus `dir` and `file`; comma-separate for any of several |
+| `type:video` | `video`, `audio`, `image`, `doc`, `archive`, `code` by extension, plus `dir` and `file`; comma-separate for any of several (`type:dir,video`) |
 | `ext:mp4,mov` | Names ending in any of the extensions |
+| `sym:parse` | Functions, types, macros and modules whose name contains `parse`, defined in source files; other parts of the query filter the files (`sym:render ext:tsx`) |
+
+In symbol results, Enter prints `path:line`.
 
 ## Performance
 
@@ -64,6 +71,9 @@ On an M4 Pro with 6.35 million files and folders (`build/fplussearch --bench`):
 | `readme` | 36,933 | 0.25 ms | 0.7 to 2.6 ms |
 | `node_modules` | 13,956 | 0.22 ms | 0.6 to 2.5 ms |
 | `2024` | 2,427 | 0.32 ms | 1.1 to 2.4 ms |
+| `sym:useEffect` | 985 | 0.24 ms | 2.8 ms |
+| `sym:parse` | 309,109 | 0.43 ms | 3.7 ms |
+| `sym:render ext:tsx` | 414 | 0.62 ms | 7.4 ms |
 
 The pause column varies between runs because it measures how quickly macOS
 wakes idle cores.
@@ -72,13 +82,13 @@ Memory:
 
 | | |
 | --- | ---: |
-| Index (memory-mapped cache file) | 96 MB |
-| Process footprint while searching | 2.5 MB |
-| Resident, including the mapped index | 99 MB |
-| Peak while indexing | 282 MB |
+| File index (memory-mapped cache file) | 96 MB |
+| Symbol index, 16.9 million definitions (memory-mapped, read only by `sym:` queries) | 128 MB |
+| Process footprint while searching | 2.4 MB |
+| Peak while indexing | 323 MB |
 
 The index pages are clean file-backed memory, so macOS can drop them under
-memory pressure and read them back from the cache file.
+memory pressure and read them back from the cache files.
 
 ## How it works
 
@@ -109,6 +119,13 @@ memory pressure and read them back from the cache file.
   full.
 - Search threads run at interactive priority and spin for 250 ms after each
   search, because an idle core cluster takes milliseconds to ramp back up.
+- Symbols come from a per-language token scanner (comments and strings are
+  skipped) with rules for definitions in C, C++, Objective-C, Rust, Go,
+  Python, JavaScript, TypeScript, Swift, Java, Kotlin, C#, Ruby, PHP, Lua,
+  Zig and shell. The symbol index stores each distinct name once, with the
+  files that define it; the line number is found again when a result is
+  shown. Source files are read with the file cache bypassed, so indexing
+  doesn't evict other cached files.
 
 ## Limitations
 
@@ -119,6 +136,9 @@ memory pressure and read them back from the cache file.
   changes made while fplussearch is open do not appear until the next launch.
 - Results list folders first, then files, each sorted by name (byte order);
   they are not ranked by relevance.
+- Symbol extraction is heuristic, not a parser: unusual code can be missed or
+  misread. Source files over 1 MB and files that look minified are skipped,
+  and only a name's first definition in each file is listed.
 
 ## License
 

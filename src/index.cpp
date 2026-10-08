@@ -1,5 +1,9 @@
 #include "index.hpp"
 
+#include "store.hpp"
+#include "symbols.hpp"
+#include "symindex.hpp"
+
 #include <fcntl.h>
 #include <pthread.h>
 #include <sys/attr.h>
@@ -10,6 +14,8 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
+#include <random>
 #include <condition_variable>
 #include <cstdio>
 #include <functional>
@@ -53,233 +59,53 @@ const std::unordered_map<std::string_view, uint8_t>& ext_table() {
   return table;
 }
 
-bool is_hex_name(std::string_view s) {
-  if (s.size() < 16 || s.size() > 255) return false;
-  for (char c : s)
-    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
-  return true;
-}
-
-void pack_hex(std::string_view s, std::vector<char>& out) {
-  auto val = [](char c) { return c <= '9' ? c - '0' : c - 'a' + 10; };
-  out.push_back(char(uint8_t(s.size())));
-  for (size_t i = 0; i < s.size(); i += 2)
-    out.push_back(char((val(s[i]) << 4) | (i + 1 < s.size() ? val(s[i + 1]) : 0)));
-}
-
-// 4 MB of anonymous memory. Mapped directly because malloc keeps freed
-// medium-sized blocks resident, and the index build frees hundreds of MB.
-constexpr size_t kMapChunk = size_t(4) << 20;
-struct Unmap {
-  void operator()(void* p) const { munmap(p, kMapChunk); }
-};
-using MapChunk = std::unique_ptr<void, Unmap>;
-
-MapChunk map_chunk() {
-  void* p = mmap(nullptr, kMapChunk, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-  if (p == MAP_FAILED) throw std::bad_alloc();
-  return MapChunk(p);
-}
-
-// Append-only array in fixed chunks: growth never copies, so building the
-// index never holds two copies of an array.
-template <typename T>
-class Chunked {
- public:
-  void push_back(const T& v) {
-    if (n_ % kChunk == 0) chunks_.push_back(map_chunk());
-    static_cast<T*>(chunks_.back().get())[n_ % kChunk] = v;
-    ++n_;
-  }
-  const T& operator[](size_t i) const { return static_cast<const T*>(chunks_[i / kChunk].get())[i % kChunk]; }
-  size_t size() const { return n_; }
-  void clear() {
-    std::vector<MapChunk>().swap(chunks_);
-    n_ = 0;
-  }
-
- private:
-  static constexpr size_t kChunk = kMapChunk / sizeof(T);
-  std::vector<MapChunk> chunks_;
-  size_t n_ = 0;
-};
-
-// Deduplicates names as they are scanned. Not thread-safe.
-class Interner {
- public:
-  uint32_t intern(std::string_view s, uint32_t hash) {
-    if (slots_.empty()) slots_.assign(size_t(1) << 20, 0);
-    size_t mask = slots_.size() - 1;
-    for (size_t i = hash & mask;; i = (i + 1) & mask) {
-      uint32_t slot = slots_[i];
-      if (slot == 0) break;
-      if (hash_[slot - 1] == hash && get(slot - 1) == s) return slot - 1;
-    }
-    const uint32_t id = uint32_t(ptr_.size());
-    if (arena_.empty() || used_ + s.size() > kMapChunk) {
-      arena_.push_back(map_chunk());
-      used_ = 0;
-    }
-    char* dst = static_cast<char*>(arena_.back().get()) + used_;
-    std::memcpy(dst, s.data(), s.size());
-    used_ += s.size();
-    ptr_.push_back(dst);
-    len_.push_back(uint16_t(s.size()));
-    hash_.push_back(hash);
-    insert(id);
-    if (ptr_.size() * 2 > slots_.size()) grow();
-    return id;
-  }
-
-  std::string_view get(uint32_t id) const { return {ptr_[id], len_[id]}; }
-  size_t size() const { return ptr_.size(); }
-  void drop_table() { slots_ = {}; }
-
- private:
-  void insert(uint32_t id) {
-    size_t mask = slots_.size() - 1;
-    size_t i = hash_[id] & mask;
-    while (slots_[i]) i = (i + 1) & mask;
-    slots_[i] = id + 1;
-  }
-
-  void grow() {
-    slots_.assign(slots_.size() * 2, 0);
-    for (uint32_t id = 0; id < ptr_.size(); ++id) insert(id);
-  }
-
-  std::vector<MapChunk> arena_;
-  size_t used_ = 0;
-  Chunked<const char*> ptr_;
-  Chunked<uint16_t> len_;
-  Chunked<uint32_t> hash_;
-  std::vector<uint32_t> slots_;
-};
-
-// On-disk layout: a header with (offset, size) for each field, then the
-// fields, each 64-byte aligned.
-enum Field : int {
+// Field order in the cache file.
+enum Field : size_t {
   kRoot = 0,
-  kSections = 1,  // 6 fields per section, see section_field()
-  kParents = kSections + 4 * 6,
+  kSections = 1,  // kSectionFields per section
+  kParents = kSections + 4 * kSectionFields,
   kFileKind,
   kFileSize,
   kBigSizes,
   kGrams,
   kFields
 };
-int section_field(int section, int f) { return kSections + section * 6 + f; }
-enum SectionField : int { kBytes, kBlockOff, kBlockFirst, kNameOff, kCounts, kOverflow };
+enum Meta : size_t { kMetaN, kMetaDirs, kMetaParentBits, kMetaBuildId };
 
-constexpr char kMagic[8] = {'F', 'S', 'R', 'C', 'H', 'I', 'X', '5'};
+constexpr char kMagic[8] = {'F', 'S', 'R', 'C', 'H', 'I', 'X', '6'};
 constexpr uint8_t kRawDir = 0xff;  // never a valid file kind byte
 
-struct Header {
-  char magic[8];
-  uint32_t parent_bits;
-  uint32_t unused;
-  uint64_t n;
-  uint64_t dirs;
-  uint64_t field[kFields][2];
-};
-
-// A finished field: takes ownership of a vector without copying it.
-struct Blob {
-  std::shared_ptr<const void> owner;
-  const char* data = nullptr;
-  size_t size = 0;
-};
-
 struct Built {
-  std::string root;
-  uint32_t n = 0, dirs = 0, parent_bits = 0;
-  std::array<Blob, kFields> fields;
+  std::array<uint64_t, 8> meta{};
+  std::vector<Blob> fields = std::vector<Blob>(kFields);
+  BigVec<CodeFile> code;  // source files for the symbol index, by entry
 };
 
-template <typename T>
-void put(Built& b, int field, std::vector<T>&& v) {
-  auto owned = std::make_shared<const std::vector<T>>(std::move(v));
-  b.fields[size_t(field)] = {owned, reinterpret_cast<const char*>(owned->data()), owned->size() * sizeof(T)};
-}
-
-template <typename T>
-bool span_of(Span<T>& s, const char* base, size_t len, uint64_t off, uint64_t size) {
-  if (off > len || size > len - off || off % alignof(T) || size % sizeof(T)) return false;
-  s.p = reinterpret_cast<const T*>(base + off);
-  s.n = size / sizeof(T);
-  return true;
-}
-
-// Points `ix` at fields laid out as described by `fld` (offsets into base).
-bool attach(Index& ix, const char* base, size_t len, uint32_t n, uint32_t dirs, uint32_t parent_bits,
-            const uint64_t (*fld)[2]) {
+bool attach(Index& ix, Fields&& f) {
   Span<char> root;
-  bool ok = span_of(root, base, len, fld[kRoot][0], fld[kRoot][1]);
+  if (!f.get(kRoot, root)) return false;
+  Index r;
+  r.root.assign(root.p, root.n);
+  r.n = uint32_t(f.meta[kMetaN]);
+  r.dirs = uint32_t(f.meta[kMetaDirs]);
+  r.parent_bits = uint32_t(f.meta[kMetaParentBits]);
+  r.build_id = f.meta[kMetaBuildId];
+  bool ok = f.meta[kMetaN] <= UINT32_MAX && r.dirs <= r.n;
+  for (size_t s = 0; s < 4; ++s) ok = ok && f.section(kSections + s * kSectionFields, r.sections[s], s % 2 == 1);
+  ok = ok && f.get(kParents, r.parents) && f.get(kFileKind, r.file_kind) && f.get(kFileSize, r.file_size) &&
+       f.get(kBigSizes, r.big_sizes) && f.get(kGrams, r.grams) && r.grams.n == 2 * kGramSlots &&
+       r.file_kind.n == r.n - r.dirs && r.file_size.n == r.n - r.dirs && r.parent_bits >= 1 &&
+       r.parent_bits <= 32 && r.parents.n >= (uint64_t(r.n) * r.parent_bits + 7) / 8 + 8;
   if (!ok) return false;
-  ix.root.assign(root.p, root.n);
-  ix.n = n;
-  ix.dirs = dirs;
-  ix.parent_bits = parent_bits;
-  for (int s = 0; s < 4; ++s) {
-    Section& sec = ix.sections[size_t(s)];
-    sec.hex = s % 2 == 1;
-    auto f = [&](int k) { return fld[section_field(s, k)]; };
-    ok = ok && span_of(sec.bytes, base, len, f(kBytes)[0], f(kBytes)[1]) &&
-         span_of(sec.block_off, base, len, f(kBlockOff)[0], f(kBlockOff)[1]) &&
-         span_of(sec.block_first, base, len, f(kBlockFirst)[0], f(kBlockFirst)[1]) &&
-         span_of(sec.name_off, base, len, f(kNameOff)[0], f(kNameOff)[1]) &&
-         span_of(sec.counts, base, len, f(kCounts)[0], f(kCounts)[1]) &&
-         span_of(sec.overflow, base, len, f(kOverflow)[0], f(kOverflow)[1]) && sec.block_off.n > 0 &&
-         sec.block_first.n == sec.block_off.n && sec.counts.n == sec.name_off.n;
-  }
-  ok = ok && span_of(ix.parents, base, len, fld[kParents][0], fld[kParents][1]) &&
-       span_of(ix.file_kind, base, len, fld[kFileKind][0], fld[kFileKind][1]) &&
-       span_of(ix.file_size, base, len, fld[kFileSize][0], fld[kFileSize][1]) &&
-       span_of(ix.big_sizes, base, len, fld[kBigSizes][0], fld[kBigSizes][1]) &&
-       span_of(ix.grams, base, len, fld[kGrams][0], fld[kGrams][1]) && ix.grams.n == 2 * kGramSlots &&
-       ix.file_kind.n == n - dirs && ix.file_size.n == n - dirs && parent_bits >= 1 && parent_bits <= 32 &&
-       ix.parents.n >= (uint64_t(n) * parent_bits + 7) / 8 + 8;
-  ix.bytes = len;
-  return ok;
-}
-
-// Fills in the header and returns the total file size.
-uint64_t layout(const Built& b, Header& h) {
-  h = {};
-  std::memcpy(h.magic, kMagic, sizeof kMagic);
-  h.parent_bits = b.parent_bits;
-  h.n = b.n;
-  h.dirs = b.dirs;
-  uint64_t off = (sizeof h + 63) & ~uint64_t(63);
-  for (int i = 0; i < kFields; ++i) {
-    h.field[i][0] = off;
-    h.field[i][1] = b.fields[size_t(i)].size;
-    off = (off + h.field[i][1] + 63) & ~uint64_t(63);
-  }
-  return off;
-}
-
-bool save(const Built& b, const std::string& file) {
-  Header h;
-  layout(b, h);
-  std::string tmp = file + ".tmp";
-  FILE* f = std::fopen(tmp.c_str(), "wb");
-  if (!f) return false;
-  static const char zeros[64] = {};
-  bool ok = std::fwrite(&h, sizeof h, 1, f) == 1;
-  uint64_t pos = sizeof h;
-  for (int i = 0; i < kFields && ok; ++i) {
-    ok = std::fwrite(zeros, 1, h.field[i][0] - pos, f) == h.field[i][0] - pos;
-    const Blob& v = b.fields[size_t(i)];
-    ok = ok && std::fwrite(v.data, 1, v.size, f) == v.size;
-    pos = h.field[i][0] + v.size;
-  }
-  ok &= std::fclose(f) == 0;
-  if (!ok || std::rename(tmp.c_str(), file.c_str()) != 0) {
-    std::remove(tmp.c_str());
-    return false;
-  }
+  r.bytes = f.bytes;
+  r.backing = std::move(f.backing);
+  ix = std::move(r);
   return true;
+}
+
+uint64_t new_build_id() {
+  return hash_bytes(uint64_t(std::chrono::system_clock::now().time_since_epoch().count()),
+                    std::to_string(std::random_device{}()));
 }
 
 struct Work {
@@ -292,7 +118,9 @@ struct Item {
   uint16_t len;
   uint32_t hash;
   uint64_t size;
+  uint64_t mtime;  // nanoseconds; only kept for source files
   uint8_t kind;
+  bool code;
 };
 
 std::string join(const std::string& dir, std::string_view name) {
@@ -366,7 +194,7 @@ class Scanner {
 
     attrlist al{};
     al.bitmapcount = ATTR_BIT_MAP_COUNT;
-    al.commonattr = ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_NAME | ATTR_CMN_ERROR | ATTR_CMN_OBJTYPE;
+    al.commonattr = ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_NAME | ATTR_CMN_ERROR | ATTR_CMN_OBJTYPE | ATTR_CMN_MODTIME;
     al.fileattr = ATTR_FILE_DATALENGTH;
 
     for (;;) {
@@ -397,6 +225,13 @@ class Scanner {
           std::memcpy(&type, f, sizeof type);
           f += sizeof type;
         }
+        uint64_t mtime = 0;
+        if (ret.commonattr & ATTR_CMN_MODTIME) {
+          timespec ts;
+          std::memcpy(&ts, f, sizeof ts);
+          f += sizeof ts;
+          mtime = uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec);
+        }
         uint64_t size = 0;
         if (ret.fileattr & ATTR_FILE_DATALENGTH) {
           off_t v;
@@ -408,8 +243,9 @@ class Scanner {
         std::string_view name(nm, nl);
         const bool dir = type == VDIR;
         const uint8_t kind = dir ? kRawDir : uint8_t(size_class(size) << 4 | categorize(name));
+        const bool code = !dir && type == VREG && size <= kMaxSourceSize && lang_of(name) != Lang::None;
         items.push_back({uint32_t(names.size()), uint16_t(nl), uint32_t(std::hash<std::string_view>{}(name)),
-                         size, kind});
+                         size, mtime, kind, code});
         names.insert(names.end(), nm, nm + nl);
         if (dir) {
           std::string child = join(w.path, name);
@@ -427,8 +263,10 @@ class Scanner {
     std::lock_guard lk(m_);
     const uint32_t base = uint32_t(name_.size());
     if (base + items.size() < UINT32_MAX) {
-      for (const auto& it : items)
+      for (const auto& it : items) {
+        if (it.code) code_.push_back({uint32_t(name_.size()), it.mtime});
         add_entry(names_.intern({names.data() + it.off, it.len}, it.hash), w.id, it.size, it.kind);
+      }
       for (auto& [local, path] : subdirs) stack_.push_back({base + local, std::move(path)});
       pending_ += subdirs.size();
       if (progress_) progress_->entries.store(name_.size(), std::memory_order_relaxed);
@@ -442,28 +280,28 @@ class Scanner {
     names_.drop_table();
     const size_t n = name_.size(), names = names_.size();
     Built b;
-    b.root = root_;
-    b.n = uint32_t(n);
+    b.meta[kMetaN] = n;
+    b.meta[kMetaBuildId] = new_build_id();
 
-    std::vector<uint8_t> used(names, 0);  // bit 0: some directory, bit 1: some file
+    BigVec<uint8_t> used(names, 0);  // bit 0: some directory, bit 1: some file
     uint32_t dirs = 0;
     for (size_t e = 0; e < n; ++e) {
       const bool dir = kind_[e] == kRawDir;
       used[name_[e]] |= dir ? 1 : 2;
       dirs += dir;
     }
-    b.dirs = dirs;
+    b.meta[kMetaDirs] = dirs;
 
     struct Set {
-      std::vector<uint32_t> order;  // name ids: text names then hex names
+      BigVec<uint32_t> order;  // name ids: text names then hex names
       size_t text = 0;
-      std::vector<uint32_t> rank;   // name id -> position in order
-      std::vector<uint32_t> first;  // position -> first entry, plus end
+      BigVec<uint32_t> rank;   // name id -> position in order
+      BigVec<uint32_t> first;  // position -> first entry, plus end
     };
     std::array<Set, 2> sets;
     for (int s = 0; s < 2; ++s) {
       Set& set = sets[size_t(s)];
-      std::vector<uint32_t> hex;
+      BigVec<uint32_t> hex;
       for (uint32_t u = 0; u < names; ++u) {
         if (!(used[u] & (1 << s))) continue;
         (is_hex_name(names_.get(u)) ? hex : set.order).push_back(u);
@@ -489,8 +327,8 @@ class Scanner {
       for (size_t i = 0; i + 1 < set.first.size(); ++i) set.first[i + 1] += set.first[i];
 
     {
-      std::vector<uint32_t> grams(2 * kGramSlots, 0);
-      std::vector<uint32_t> seen(kGramSlots, 0);
+      BigVec<uint32_t> grams(2 * kGramSlots, 0);
+      BigVec<uint32_t> seen(kGramSlots, 0);
       uint32_t stamp = 0;
       for (int s = 0; s < 2; ++s) {
         const Set& set = sets[size_t(s)];
@@ -509,20 +347,25 @@ class Scanner {
           }
         }
       }
-      put(b, kGrams, std::move(grams));
+      b.fields[kGrams] = blob(std::move(grams));
     }
 
-    for (int s = 0; s < 2; ++s) {
-      const Set& set = sets[size_t(s)];
-      write_section(b, 2 * s, set, 0, set.text, false);
-      write_section(b, 2 * s + 1, set, set.text, set.order.size(), true);
+    for (size_t s = 0; s < 2; ++s) {
+      const Set& set = sets[s];
+      for (size_t hex = 0; hex < 2; ++hex) {
+        const size_t k0 = hex ? set.text : 0, k1 = hex ? set.order.size() : set.text;
+        auto fields = make_section(
+            k1 - k0, [&](size_t k) { return names_.get(set.order[k0 + k]); }, set.first.data() + k0, hex);
+        for (size_t f = 0; f < kSectionFields; ++f)
+          b.fields[kSections + (2 * s + hex) * kSectionFields + f] = std::move(fields[f]);
+      }
     }
     names_ = {};  // all name strings are now in the sections
     for (auto& set : sets) set.order = {};
 
-    std::vector<uint32_t> new_id(n);
+    BigVec<uint32_t> new_id(n);
     {
-      std::array<std::vector<uint32_t>, 2> next;
+      std::array<BigVec<uint32_t>, 2> next;
       for (int s = 0; s < 2; ++s) next[size_t(s)].assign(sets[size_t(s)].first.begin(), sets[size_t(s)].first.end() - 1);
       for (size_t e = 0; e < n; ++e) {
         const int s = kind_[e] == kRawDir ? 0 : 1;
@@ -531,13 +374,14 @@ class Scanner {
     }
     for (auto& set : sets) set.rank = {};
 
-    b.parent_bits = uint32_t(std::max(1, std::bit_width(std::max<uint32_t>(dirs, 1) - 1)));
+    const uint32_t parent_bits = uint32_t(std::max(1, std::bit_width(std::max<uint32_t>(dirs, 1) - 1)));
+    b.meta[kMetaParentBits] = parent_bits;
     {
-      std::vector<uint8_t> parents((uint64_t(n) * b.parent_bits + 7) / 8 + 8, 0);
-      std::vector<uint8_t> kind(n - dirs);
-      std::vector<uint32_t> size(n - dirs);
+      BigVec<uint8_t> parents((uint64_t(n) * parent_bits + 7) / 8 + 8, 0);
+      BigVec<uint8_t> kind(n - dirs);
+      BigVec<uint32_t> size(n - dirs);
       for (size_t e = 0; e < n; ++e) {
-        const uint64_t bit = uint64_t(new_id[e]) * b.parent_bits;
+        const uint64_t bit = uint64_t(new_id[e]) * parent_bits;
         uint64_t v = uint64_t(new_id[parent_[e]]) << (bit & 7), w;
         std::memcpy(&w, parents.data() + (bit >> 3), sizeof w);
         w |= v;
@@ -549,66 +393,22 @@ class Scanner {
       }
       for (auto& o : big_) o.key = new_id[o.key];
       std::sort(big_.begin(), big_.end(), [](const Overflow& a, const Overflow& c) { return a.key < c.key; });
-      put(b, kParents, std::move(parents));
-      put(b, kFileKind, std::move(kind));
-      put(b, kFileSize, std::move(size));
-      put(b, kBigSizes, std::move(big_));
+      b.fields[kParents] = blob(std::move(parents));
+      b.fields[kFileKind] = blob(std::move(kind));
+      b.fields[kFileSize] = blob(std::move(size));
+      b.fields[kBigSizes] = blob(std::move(big_));
+      b.code.reserve(code_.size());
+      for (const CodeFile& c : code_) b.code.push_back({new_id[c.entry], c.mtime});
+      BigVec<CodeFile>().swap(code_);
+      std::sort(b.code.begin(), b.code.end(), [](const CodeFile& a, const CodeFile& c) { return a.entry < c.entry; });
     }
     new_id = {};
     name_.clear();
     parent_.clear();
     size_.clear();
     kind_.clear();
-    put(b, kRoot, std::vector<char>(root_.begin(), root_.end()));
+    b.fields[kRoot] = blob(BigVec<char>(root_.begin(), root_.end()));
     return b;
-  }
-
-  template <typename SetT>
-  void write_section(Built& b, int section, const SetT& set, size_t k0, size_t k1, bool hex) {
-    std::vector<char> bytes;
-    std::vector<uint32_t> block_off, block_first;
-    std::vector<uint16_t> name_off;
-    std::vector<uint8_t> counts;
-    std::vector<Overflow> overflow;
-    size_t total = kPad;
-    for (size_t k = k0; k < k1; ++k) {
-      const size_t len = names_.get(set.order[k]).size();
-      total += hex ? 1 + (len + 1) / 2 : len + 1;
-    }
-    bytes.reserve(total);
-    block_off.reserve((k1 - k0) / kBlock + 2);
-    block_first.reserve((k1 - k0) / kBlock + 2);
-    name_off.reserve(k1 - k0);
-    counts.reserve(k1 - k0);
-    size_t block_start = 0;
-    for (size_t k = k0; k < k1; ++k) {
-      const uint32_t i = uint32_t(k - k0);
-      if (i % kBlock == 0) {
-        block_start = bytes.size();
-        block_off.push_back(uint32_t(block_start));
-        block_first.push_back(set.first[k]);
-      }
-      name_off.push_back(uint16_t(bytes.size() - block_start));
-      const uint32_t c = set.first[k + 1] - set.first[k];
-      counts.push_back(uint8_t(std::min<uint32_t>(c, 255)));
-      if (c >= 255) overflow.push_back({i, 0, c});
-      std::string_view nm = names_.get(set.order[k]);
-      if (hex) {
-        pack_hex(nm, bytes);
-      } else {
-        bytes.insert(bytes.end(), nm.begin(), nm.end());
-        bytes.push_back('\0');
-      }
-    }
-    block_off.push_back(uint32_t(bytes.size()));
-    block_first.push_back(set.first[k1]);
-    bytes.resize(bytes.size() + kPad, '\0');
-    put(b, section_field(section, kBytes), std::move(bytes));
-    put(b, section_field(section, kBlockOff), std::move(block_off));
-    put(b, section_field(section, kBlockFirst), std::move(block_first));
-    put(b, section_field(section, kNameOff), std::move(name_off));
-    put(b, section_field(section, kCounts), std::move(counts));
-    put(b, section_field(section, kOverflow), std::move(overflow));
   }
 
   std::string root_;
@@ -622,13 +422,9 @@ class Scanner {
   Interner names_;
   Chunked<uint32_t> name_, parent_, size_;
   Chunked<uint8_t> kind_;
-  std::vector<Overflow> big_;
+  BigVec<Overflow> big_;
+  BigVec<CodeFile> code_;  // raw entry ids until finish()
 };
-
-const Overflow* find_key(const Span<Overflow>& s, uint32_t key) {
-  const Overflow* it = std::lower_bound(s.p, s.p + s.n, key, [](const Overflow& o, uint32_t k) { return o.key < k; });
-  return it != s.p + s.n && it->key == key ? it : nullptr;
-}
 
 }  // namespace
 
@@ -716,46 +512,19 @@ Index build_index(const std::string& root, unsigned threads, ScanProgress* progr
   std::string r = root;
   while (r.size() > 1 && r.back() == '/') r.pop_back();
   auto built = std::make_unique<Built>(Scanner(r, progress).run(threads ? threads : 1, background));
+  BigVec<CodeFile> code = std::move(built->code);
 
   Index ix;
-  if (save(*built, cache_file) && load_index(ix, cache_file)) return ix;
-
-  // Could not write the cache: serve the same layout from memory.
-  Header h;
-  auto buf = std::make_shared<std::vector<char>>(layout(*built, h), '\0');
-  std::memcpy(buf->data(), &h, sizeof h);
-  for (int i = 0; i < kFields; ++i)
-    if (h.field[i][1]) std::memcpy(buf->data() + h.field[i][0], built->fields[size_t(i)].data, h.field[i][1]);
+  if (!save_fields(cache_file, kMagic, built->meta, built->fields) || !load_index(ix, cache_file))
+    attach(ix, hold_fields(built->meta, std::move(built->fields)));  // could not write the cache
   built.reset();
-  attach(ix, buf->data(), buf->size(), uint32_t(h.n), uint32_t(h.dirs), h.parent_bits, h.field);
-  ix.backing = std::move(buf);
+  build_symbols(ix, code.data(), code.size(), symbol_file(cache_file), progress, background);
   return ix;
 }
 
 bool load_index(Index& ix, const std::string& file) {
-  int fd = open(file.c_str(), O_RDONLY | O_CLOEXEC);
-  if (fd < 0) return false;
-  struct stat st{};
-  if (fstat(fd, &st) != 0 || size_t(st.st_size) < sizeof(Header)) {
-    close(fd);
-    return false;
-  }
-  const size_t len = size_t(st.st_size);
-  void* map = mmap(nullptr, len, PROT_READ, MAP_SHARED, fd, 0);
-  close(fd);
-  if (map == MAP_FAILED) return false;
-  madvise(map, len, MADV_WILLNEED);
-  std::shared_ptr<const void> backing(map, [len](const void* p) { munmap(const_cast<void*>(p), len); });
-
-  const char* base = static_cast<const char*>(map);
-  Header h;
-  std::memcpy(&h, base, sizeof h);
-  if (std::memcmp(h.magic, kMagic, sizeof kMagic) != 0 || h.n > UINT32_MAX || h.dirs > h.n) return false;
-  Index tmp;
-  if (!attach(tmp, base, len, uint32_t(h.n), uint32_t(h.dirs), h.parent_bits, h.field)) return false;
-  tmp.backing = std::move(backing);
-  ix = std::move(tmp);
-  return true;
+  Fields f;
+  return map_fields(file, kMagic, kFields, f) && attach(ix, std::move(f));
 }
 
 }  // namespace fplussearch

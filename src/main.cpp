@@ -14,6 +14,7 @@
 
 #include "index.hpp"
 #include "search.hpp"
+#include "symindex.hpp"
 #include "tui.hpp"
 
 using namespace fplussearch;
@@ -43,7 +44,7 @@ void usage() {
                "\n"
                "query syntax: words (substring of name, case-insensitive, all must match)\n"
                "  \"quoted phrase\"  size:>1gb size:<=10mb  type:video|audio|image|doc|archive|code|dir|file\n"
-               "  ext:mp4,mov\n");
+               "  ext:mp4,mov  sym:name (functions, types, ... defined in source files)\n");
 }
 
 std::string cache_path(const std::string& root) {
@@ -73,18 +74,26 @@ void print_memory() {
               info.resident_size / 1e6);
 }
 
-int bench(const Index& ix, Engine& engine, std::vector<std::string> queries) {
-  if (queries.empty())
+Results run_query(const Index& ix, const SymbolIndex* sx, Engine& engine, const Query& q, size_t limit) {
+  if (q.syms.empty()) return engine.search(ix, q, limit);
+  return sx ? engine.search_symbols(ix, *sx, q, limit) : Results{};
+}
+
+int bench(const Index& ix, const SymbolIndex* sx, Engine& engine, std::vector<std::string> queries) {
+  if (queries.empty()) {
     queries = {"size:>1gb type:video", "a", "e", "readme", "config.json", "ext:mp4", "type:image",
                "lib", "node_modules", "zzqxj", "png ico", "size:>100mb"};
+    if (sx) queries.insert(queries.end(), {"sym:parse", "sym:render ext:tsx", "sym:main type:file", "sym:x"});
+  }
   std::printf("%zu entries (%u directories), index %.1f MB\n", ix.count(), ix.dirs, ix.bytes / 1e6);
+  if (sx) std::printf("%zu symbol definitions, symbol index %.1f MB\n", sx->occ.n, sx->bytes / 1e6);
   // hot: back to back. typing: 80 ms apart, like keystrokes. cold: 500 ms
   // apart, after the workers have gone to sleep and the cores have idled.
   std::printf("%-24s %10s %10s %10s %10s\n", "query", "matches", "hot ms", "typing ms", "cold ms");
   auto timed = [&](const std::string& qs, Results& r) {
     auto t0 = Clock::now();
     Query q = parse_query(qs);
-    r = engine.search(ix, q, 50);
+    r = run_query(ix, sx, engine, q, 50);
     return ms_since(t0);
   };
   auto median = [](std::vector<double> v) {
@@ -157,21 +166,37 @@ int main(int argc, char** argv) {
   }
 
   Engine engine(threads);
+  SymbolIndex symbols;
+  auto load_syms = [&]() -> const SymbolIndex* {
+    return load_symbols(symbols, symbol_file(cache), *ix) ? &symbols : nullptr;
+  };
 
   if (do_bench) {
     if (!ix) ix = build(root, cache, scan_threads);
-    return bench(*ix, engine, words);
+    return bench(*ix, load_syms(), engine, words);
   }
 
   if (!words.empty() || !isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) {
     if (!ix) ix = build(root, cache, scan_threads);
+    const SymbolIndex* sx = load_syms();
     std::string text;
     for (const auto& w : words) text += (text.empty() ? "" : " ") + w;
     auto t0 = Clock::now();
     Query q = parse_query(text);
-    Results r = engine.search(*ix, q, limit);
+    Results r = run_query(*ix, sx, engine, q, limit);
     double ms = ms_since(t0);
-    for (uint32_t e : r.top) std::printf("%s\n", ix->path(e).c_str());
+    if (!q.syms.empty() && !sx) std::fprintf(stderr, "no symbol index; run with --reindex\n");
+    for (uint32_t e : r.top) {
+      if (q.syms.empty()) {
+        std::printf("%s\n", ix->path(e).c_str());
+        continue;
+      }
+      const std::string path = ix->path(sx->occ[e]);
+      const std::string_view name = sx->symbol(e);
+      const SymbolLocation loc = locate_symbol(path, name);
+      std::printf("%s:%u: %s %.*s\n", path.c_str(), loc.line, loc.found ? kind_name(loc.kind) : "?",
+                  int(name.size()), name.data());
+    }
     if (!q.error.empty()) std::fprintf(stderr, "%s\n", q.error.c_str());
     std::fprintf(stderr, "%llu matches in %.3f ms (%zu entries)\n", (unsigned long long)r.total, ms,
                  ix->count());

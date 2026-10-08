@@ -13,6 +13,7 @@
 #include <deque>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 
 namespace fplussearch {
 
@@ -67,9 +68,50 @@ std::string fmt_ms(double ms) {
   return buf;
 }
 
+// Text from the filesystem made safe to print: control characters (C0, DEL,
+// C1) and invalid UTF-8 become '?', so a crafted file name cannot inject
+// terminal escape sequences.
+std::string printable(std::string_view s) {
+  std::string out;
+  out.reserve(s.size());
+  for (size_t i = 0; i < s.size();) {
+    const unsigned char c = uint8_t(s[i]);
+    if (c < 0x80) {
+      out += (c < 0x20 || c == 0x7f) ? '?' : char(c);
+      ++i;
+      continue;
+    }
+    const size_t len = c >= 0xf0 ? 4 : c >= 0xe0 ? 3 : c >= 0xc2 ? 2 : 0;
+    bool ok = len && i + len <= s.size();
+    uint32_t cp = ok ? c & (0xff >> (len + 1)) : 0;
+    for (size_t k = 1; ok && k < len; ++k) {
+      const unsigned char d = uint8_t(s[i + k]);
+      ok = (d & 0xc0) == 0x80;
+      cp = cp << 6 | (d & 0x3f);
+    }
+    ok = ok && cp >= 0xa0 && cp <= 0x10ffff && !(cp >= 0xd800 && cp <= 0xdfff) &&
+         !(len == 3 && cp < 0x800) && !(len == 4 && cp < 0x10000);
+    if (ok) {
+      out.append(s.substr(i, len));
+      i += len;
+    } else {
+      out += '?';
+      ++i;
+    }
+  }
+  return out;
+}
+
+// Columns `s` occupies, ignoring ANSI escape sequences.
 size_t display_width(std::string_view s) {
   size_t w = 0;
-  for (unsigned char c : s) w += (c & 0xc0) != 0x80;
+  for (size_t i = 0; i < s.size(); ++i) {
+    if (s[i] == '\x1b') {
+      while (i < s.size() && !((s[i] | 0x20) >= 'a' && (s[i] | 0x20) <= 'z' && s[i] != '\x1b' && s[i] != '[')) ++i;
+      continue;
+    }
+    w += (uint8_t(s[i]) & 0xc0) != 0x80;
+  }
   return w;
 }
 
@@ -115,6 +157,7 @@ class App {
   App(std::shared_ptr<const Index> ix, Engine& engine, const TuiOptions& opt)
       : ix_(std::move(ix)), engine_(engine), opt_(opt) {
     if (const char* h = std::getenv("HOME")) home_ = h;
+    if (ix_) sx_ = load(*ix_);
   }
 
   std::string run() {
@@ -142,8 +185,17 @@ class App {
       ssize_t n = ::read(STDIN_FILENO, buf, sizeof buf);
       if (n <= 0) break;
       bool changed = false;
+      // Keys that act on results (selection, Enter) must see the results of
+      // edits earlier in the same read, e.g. a pasted "query\r".
+      auto settle = [&] {
+        if (!changed) return;
+        changed = false;
+        sel_ = 0;
+        search(true);
+      };
       for (ssize_t i = 0; i < n && !quit; ++i) {
         unsigned char c = uint8_t(buf[i]);
+        if (c == 0x1b || c == '\r' || c == '\n' || c == 0x10 || c == 0x0e) settle();
         if (c == 0x1b) {
           if (i + 2 < n && buf[i + 1] == '[') {
             if (buf[i + 2] == 'A') move(-1);
@@ -155,7 +207,7 @@ class App {
         } else if (c == 0x03 || c == 0x04) {
           quit = true;
         } else if (c == '\r' || c == '\n') {
-          if (ix_ && sel_ < int(res_.top.size())) chosen = ix_->path(res_.top[size_t(sel_)]);
+          if (ix_ && sel_ < int(res_.top.size())) chosen = selected_path(res_.top[size_t(sel_)]);
           quit = !chosen.empty();
         } else if (c == 0x10) {
           move(-1);
@@ -173,10 +225,7 @@ class App {
           query_ += char(c), changed = true;
         }
       }
-      if (changed) {
-        sel_ = 0;
-        search(true);
-      }
+      settle();
     }
     restore_terminal();
     if (scanner_.joinable()) scanner_.detach();
@@ -186,14 +235,21 @@ class App {
   bool scanning() const { return scanning_; }
 
  private:
+  std::shared_ptr<const SymbolIndex> load(const Index& ix) const {
+    auto sx = std::make_shared<SymbolIndex>();
+    return load_symbols(*sx, symbol_file(opt_.cache_file), ix) ? sx : nullptr;
+  }
+
   void start_scan() {
     scanning_ = true;
     const bool background = ix_ != nullptr;
     scanner_ = std::thread([this, background] {
       auto fresh = std::make_shared<Index>(
           build_index(opt_.root, opt_.scan_threads, &progress_, background, opt_.cache_file));
+      auto sx = load(*fresh);
       std::lock_guard lk(scan_m_);
       scanned_ = std::move(fresh);
+      scanned_sx_ = std::move(sx);
     });
   }
 
@@ -201,9 +257,26 @@ class App {
     std::lock_guard lk(scan_m_);
     if (!scanned_) return false;
     ix_ = std::move(scanned_);
+    sx_ = std::move(scanned_sx_);
+    locs_.clear();
     scanning_ = false;
     scanner_.join();
     return true;
+  }
+
+  // Path of a result; for symbols with the definition's line appended.
+  std::string selected_path(uint32_t r) {
+    if (!sym_mode_) return ix_->path(r);
+    const SymbolLocation& loc = location(r);
+    const std::string path = ix_->path(sx_->occ[r]);
+    return loc.found ? path + ":" + std::to_string(loc.line) : path;
+  }
+
+  const SymbolLocation& location(uint32_t occurrence) {
+    auto it = locs_.find(occurrence);
+    if (it == locs_.end())
+      it = locs_.emplace(occurrence, locate_symbol(ix_->path(sx_->occ[occurrence]), sx_->symbol(occurrence))).first;
+    return it->second;
   }
 
   void search(bool record = false) {
@@ -211,13 +284,17 @@ class App {
     size_t limit = size_t(std::max(1, rows_ - 8));
     auto t0 = std::chrono::steady_clock::now();
     Query q = parse_query(query_);
-    if (q.terms.empty() && q.exts.empty() && !q.has_size && !q.cat_mask && q.want == Want::Any) {
+    sym_mode_ = !q.syms.empty();
+    if (sym_mode_) {
+      res_ = sx_ ? engine_.search_symbols(*ix_, *sx_, q, limit) : Results{};
+    } else if (q.terms.empty() && q.exts.empty() && !q.has_size && q.types == kTypeAny) {
       res_ = {};
     } else {
       res_ = engine_.search(*ix_, q, limit);
     }
     last_ms_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     error_ = q.error;
+    if (sym_mode_ && !sx_) error_ = scanning_ ? "the symbol index is still being built" : "no symbol index yet";
     sel_ = std::min(sel_, std::max(0, int(res_.top.size()) - 1));
     if (record && !query_.empty()) {
       times_.push_back(last_ms_);
@@ -257,11 +334,16 @@ class App {
     std::string out = "\x1b[?25l";
 
     std::string title = std::string(kBold) + "fplussearch" + kReset + kDim + "  ";
-    title += opt_.root == "/" ? "whole disk" : opt_.root;
+    title += opt_.root == "/" ? "whole disk" : printable(opt_.root);
     if (ix_) title += " · " + commas(ix_->count()) + " files and folders";
     if (scanning_) {
-      title += ix_ ? " · refreshing " : " · indexing ";
-      title += commas(progress_.entries.load(std::memory_order_relaxed));
+      const uint64_t sources = progress_.source_files.load(std::memory_order_relaxed);
+      if (sources) {
+        title += " · symbols " + commas(sources) + " files";
+      } else {
+        title += ix_ ? " · refreshing " : " · indexing ";
+        title += commas(progress_.entries.load(std::memory_order_relaxed));
+      }
     }
     line(out, 2, pad + title);
 
@@ -273,7 +355,7 @@ class App {
       stats = std::string(kDim) + count + kGreen + ms;
       stats_w = display_width(count) + display_width(ms);
     }
-    std::string q = clip(query_, inner > stats_w + 6 ? inner - stats_w - 6 : 1);
+    std::string q = clip(printable(query_), inner > stats_w + 6 ? inner - stats_w - 6 : 1);
     size_t qw = display_width(q);
     std::string prompt = pad + kBlue + "❯ " + kReset + kBold + q + kReset;
     size_t gap = inner > qw + 2 + stats_w ? inner - qw - 2 - stats_w : 1;
@@ -288,16 +370,24 @@ class App {
     if (!ix_) {
       line(out, row++, pad + kDim + "building index…");
     } else if (!error_.empty()) {
-      line(out, row++, pad + kRed + error_);
+      line(out, row++, pad + kRed + printable(error_));
     }
     for (size_t i = 0; ix_ && i < res_.top.size() && row <= last_row; ++i, ++row) {
       uint32_t e = res_.top[i];
-      std::string name = ix_->name(e);
-      if (e == 0) name = ix_->root;
-      if (ix_->is_dir(e)) name += "/";
-      std::string nm = clip(name, inner);
-      size_t room = inner - display_width(nm);
-      std::string dir = room > 4 ? clip(dir_of(e), room - 2) : "";
+      std::string name, dir;
+      if (sym_mode_) {
+        const SymbolLocation& loc = location(e);
+        name = printable(sx_->symbol(e)) + "  " + kDim + (loc.found ? kind_name(loc.kind) : "?") + kReset;
+        e = sx_->occ[e];
+        dir = printable(dir_of(e) + "/" + ix_->name(e)) + (loc.found ? ":" + std::to_string(loc.line) : "");
+      } else {
+        name = printable(e == 0 ? ix_->root : ix_->name(e));
+        if (ix_->is_dir(e)) name += "/";
+        dir = printable(dir_of(e));
+      }
+      std::string nm = sym_mode_ ? name : clip(name, inner);
+      size_t room = inner > display_width(nm) ? inner - display_width(nm) : 0;
+      dir = room > 4 ? clip(dir, room - 2) : "";
       bool selected = int(i) == sel_;
       std::string bg = selected ? kSelect : "";
       std::string text = bg + pad + kReset + bg + nm + (dir.empty() ? "" : "  ") + kDim + dir;
@@ -334,9 +424,14 @@ class App {
   int sel_ = 0;
   int rows_ = 24, cols_ = 80;
 
+  std::shared_ptr<const SymbolIndex> sx_;
+  bool sym_mode_ = false;
+  std::unordered_map<uint32_t, SymbolLocation> locs_;  // per occurrence, for visible rows
+
   std::thread scanner_;
   std::mutex scan_m_;
   std::shared_ptr<const Index> scanned_;
+  std::shared_ptr<const SymbolIndex> scanned_sx_;
   ScanProgress progress_;
   bool scanning_ = false;
 };
