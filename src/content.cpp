@@ -16,6 +16,8 @@
 #include <cstdio>
 #include <cstring>
 #include <optional>
+#include <span>
+#include <queue>
 #include <thread>
 #include <deque>
 #include <unordered_set>
@@ -794,12 +796,13 @@ bool write_segment(const std::string& dir, uint64_t id, const std::vector<DocMet
   const uint32_t ndocs = uint32_t(docs.size());
   FieldWriter w(seg_file(dir, id, "fpc"), kMagic, kFields);
   BigVec<uint32_t> keys, off;
-  std::vector<uint32_t> list;
-  std::vector<uint8_t> masks, out;
+  std::span<const uint32_t> list;
+  std::span<const uint8_t> masks;
+  std::vector<uint8_t> out;
   uint64_t post = 0;  // bytes written so far
   w.begin(kPost);
   uint32_t t;
-  while (list.clear(), masks.clear(), next(list, masks, t)) {
+  while (next(list, masks, t)) {
     if (list.empty()) continue;
     if (post >= kBitset) return false;  // offsets must fit in 31 bits
     keys.push_back(t);
@@ -1021,16 +1024,18 @@ void ContentIndex::add_docs(std::vector<DocIn>& docs, bool background) {
       }
       raw.assign(start.back(), 0);
       raw_mask.assign(start.back(), 0);
-      BigVec<uint64_t> at(start.begin(), start.end() - 1);
       for (size_t i = 0; i < n; ++i) {
         auto [p, len] = tris(i);
         for (uint32_t j = cursor[i]; j < shard_end[i]; ++j) {
-          const uint64_t a = at[count[(p[j] >> 8) & ((1u << kShardBits) - 1)]]++;
+          const uint64_t a = start[count[(p[j] >> 8) & ((1u << kShardBits) - 1)]]++;
           raw[a] = uint32_t(i);
           raw_mask[a] = uint8_t(p[j]);
         }
         cursor[i] = shard_end[i];
       }
+      // Insertion cursors now hold bucket ends; shift to recover starts.
+      for (size_t k = start.size() - 1; k > 0; --k) start[k] = start[k - 1];
+      start[0] = 0;
     };
     std::vector<DocMeta> meta(n);
     for (size_t i = 0; i < n; ++i) meta[i] = {docs[b0 + i].path, runs[i].size, runs[i].mtime, runs[i].rank};
@@ -1038,15 +1043,15 @@ void ContentIndex::add_docs(std::vector<DocIn>& docs, bool background) {
     size_t k = 0;
     uint32_t shard = 0;
     load_shard(0);
-    const bool ok = write_segment(dir_, id, meta, [&](std::vector<uint32_t>& list, std::vector<uint8_t>& masks, uint32_t& t) {
+    const bool ok = write_segment(dir_, id, meta, [&](std::span<const uint32_t>& list, std::span<const uint8_t>& masks, uint32_t& t) {
       while (k >= keys.size()) {
         if (++shard >= kShards) return false;
         load_shard(shard);
         k = 0;
       }
       t = keys[k];
-      list.assign(raw.begin() + long(start[k]), raw.begin() + long(start[k + 1]));
-      masks.assign(raw_mask.begin() + long(start[k]), raw_mask.begin() + long(start[k + 1]));
+      list = std::span<const uint32_t>(raw.data(), raw.size()).subspan(start[k], start[k + 1] - start[k]);
+      masks = std::span<const uint8_t>(raw_mask.data(), raw_mask.size()).subspan(start[k], start[k + 1] - start[k]);
       ++k;
       return true;
     });
@@ -1114,7 +1119,11 @@ void ContentIndex::maybe_merge() {
     std::vector<uint32_t> part;
     std::vector<uint8_t> part_masks;
     const uint64_t id = next_id();
-    const bool ok = !meta.empty() && write_segment(dir_, id, meta, [&](std::vector<uint32_t>& list, std::vector<uint8_t>& masks, uint32_t& t) {
+    std::vector<uint32_t> list;
+    std::vector<uint8_t> masks;
+    const bool ok = !meta.empty() && write_segment(dir_, id, meta, [&](std::span<const uint32_t>& view, std::span<const uint8_t>& mask_view, uint32_t& t) {
+      list.clear();
+      masks.clear();
       for (;;) {
         bool any = false;
         t = UINT32_MAX;
@@ -1132,7 +1141,11 @@ void ContentIndex::maybe_merge() {
           for (size_t i = 0; i < part.size(); ++i)
             if (remap[g][part[i]] != UINT32_MAX) list.push_back(remap[g][part[i]]), masks.push_back(part_masks[i]);
         }
-        if (!list.empty()) return true;
+        if (!list.empty()) {
+          view = list;
+          mask_view = masks;
+          return true;
+        }
       }
     });
     auto seg = ok ? map_segment(dir_, id) : nullptr;
@@ -1194,21 +1207,27 @@ void ContentIndex::sync(const Index& ix, bool background, ScanProgress* progress
   }
   std::sort(want.begin(), want.end(), [](const DocIn& a, const DocIn& b) { return a.path < b.path; });
 
-  // Held: every live doc, in path order; diff the two sorted lists.
+  // Merge live docs in path order to diff against the sorted wanted list.
   auto cur = state();
   struct Held {
     std::string_view path;
     uint32_t seg, doc;
   };
-  std::vector<Held> held;
-  for (uint32_t si = 0; si < cur->segs.size(); ++si) {
+  auto later = [](const Held& a, const Held& b) { return a.path > b.path; };
+  std::priority_queue<Held, std::vector<Held>, decltype(later)> held(later);
+  std::vector<uint32_t> positions(cur->segs.size(), 0);
+  auto advance = [&](uint32_t si) {
     const SegView& v = cur->segs[si];
-    for (uint32_t k = 0; k < v.seg->ndocs; ++k) {
-      const uint32_t d = v.seg->by_path[k];
-      if (!v.is_dead(d)) held.push_back({v.seg->path(d), si, d});
+    uint32_t& k = positions[si];
+    while (k < v.seg->ndocs) {
+      const uint32_t d = v.seg->by_path[k++];
+      if (!v.is_dead(d)) {
+        held.push({v.seg->path(d), si, d});
+        break;
+      }
     }
-  }
-  std::sort(held.begin(), held.end(), [](const Held& a, const Held& b) { return a.path < b.path; });
+  };
+  for (uint32_t si = 0; si < cur->segs.size(); ++si) advance(si);
   size_t todo = 0;  // want[0, todo): the docs to (re)read, compacted in place
   std::vector<std::vector<uint64_t>> dead(cur->segs.size());
   std::vector<bool> touched(cur->segs.size(), false);
@@ -1216,21 +1235,26 @@ void ContentIndex::sync(const Index& ix, bool background, ScanProgress* progress
     if (!touched[h.seg]) dead[h.seg] = *cur->segs[h.seg].dead, touched[h.seg] = true;
     dead[h.seg][h.doc >> 6] |= uint64_t(1) << (h.doc & 63);
   };
-  size_t i = 0, j = 0;
-  while (i < want.size() || j < held.size()) {
-    if (j >= held.size() || (i < want.size() && want[i].path < held[j].path)) {
+  size_t i = 0;
+  while (i < want.size() || !held.empty()) {
+    if (held.empty() || (i < want.size() && want[i].path < held.top().path)) {
       want[todo++] = want[i++];
-    } else if (i >= want.size() || held[j].path < want[i].path) {
-      kill(held[j++]);
+      continue;
+    }
+    const Held h = held.top();
+    held.pop();
+    advance(h.seg);
+    if (i >= want.size() || h.path < want[i].path) {
+      kill(h);
     } else {
-      const Segment& s = *cur->segs[held[j].seg].seg;
+      const Segment& s = *cur->segs[h.seg].seg;
       // Not-text docs keep their stat from when they were read; recheck
       // them only when the file index reports a change.
-      if (s.size[held[j].doc] != want[i].size || s.mtime[held[j].doc] != want[i].mtime) {
-        kill(held[j]);
+      if (s.size[h.doc] != want[i].size || s.mtime[h.doc] != want[i].mtime) {
+        kill(h);
         want[todo++] = want[i];
       }
-      ++i, ++j;
+      ++i;
     }
   }
   if (std::any_of(touched.begin(), touched.end(), [](bool t) { return t; })) {
@@ -1243,7 +1267,6 @@ void ContentIndex::sync(const Index& ix, bool background, ScanProgress* progress
     }
     publish(std::move(next));
   }
-  std::vector<Held>().swap(held);
   cur.reset();
   if (progress) progress->source_files.store(todo, std::memory_order_relaxed);
   want.resize(todo);
