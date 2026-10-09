@@ -92,7 +92,7 @@ Class char_class(uint8_t b) {
   }
 }
 
-constexpr int32_t kScoreMatch = 16, kGapStart = -3, kGapExt = -1;
+constexpr int32_t kScoreMatch = 16;
 constexpr int32_t kBonusBoundary = 8, kBonusCamel = 7, kBonusConsec = 4;
 constexpr size_t kTypoMinLen = 5;  // fuzzy words this long forgive one typo
 constexpr int32_t kTypoCost = 60;  // so clean matches of the same quality rank first
@@ -130,23 +130,6 @@ size_t find_folded(std::string_view s, size_t from, uint8_t c) {
   return std::string_view::npos;
 }
 
-// Last index < `before` whose byte folds to c.
-size_t rfind_folded(std::string_view s, size_t before, uint8_t c) {
-  const uint8_t u = other_case(c);
-  size_t i = before;
-#if defined(__ARM_NEON)
-  const uint8x16_t L = vdupq_n_u8(c), U = vdupq_n_u8(u);
-  for (; i >= 16; i -= 16) {
-    const uint8x16_t v = vld1q_u8(reinterpret_cast<const uint8_t*>(s.data() + i - 16));
-    const uint64_t bits = lane_bits(vorrq_u8(vceqq_u8(v, L), vceqq_u8(v, U)));
-    if (bits) return i - 16 + size_t((63 - __builtin_clzll(bits)) >> 2);
-  }
-#endif
-  while (i-- > 0)
-    if (uint8_t(s[i]) == c || uint8_t(s[i]) == u) return i;
-  return std::string_view::npos;
-}
-
 int32_t length_cost(std::string_view name) { return int32_t(std::min<size_t>(name.size(), 80)) / 3; }
 
 // Where the name's stem ends: before its extension, ignoring a leading dot.
@@ -163,44 +146,18 @@ int32_t single_score(std::string_view name, size_t i, int32_t cap) {
   return score - length_cost(name);
 }
 
-// Where the leftmost match of `q` as a subsequence of `name` ends, or npos.
-// One pass, one compare per byte: letters fold with | 0x20, which maps
-// exactly 'A'-'Z' onto 'a'-'z'.
-size_t subseq_end(std::string_view name, std::string_view q) {
-  size_t j = 0;
-  uint8_t want = uint8_t(q[0]), set = want >= 'a' && want <= 'z' ? 0x20 : 0;
-  for (size_t i = 0; i < name.size(); ++i) {
-    if ((uint8_t(name[i]) | set) != want) continue;
-    if (++j == q.size()) return i;
-    want = uint8_t(q[j]);
-    set = want >= 'a' && want <= 'z' ? 0x20 : 0;
-  }
-  return std::string_view::npos;
-}
+size_t find_ci(std::string_view name, std::string_view q);
 
-// fzf-v1 style: the leftmost-ending match, shrunk from the right, scored
-// with boundary, camelCase and consecutive bonuses; whole-name, stem and
-// prefix matches get up to `cap` more.
 int32_t fuzzy_capped(std::string_view name, std::string_view q, int32_t cap) {
-  const size_t end = subseq_end(name, q);
-  if (end == std::string_view::npos) return kNoMatch;
-  if (q.size() == 1) return single_score(name, end, cap);
-  size_t start = end + 1;
-  for (size_t k = q.size(); k-- > 0;) {
-    start = rfind_folded(name, start, uint8_t(q[k]));
-    if (start == std::string_view::npos) return kNoMatch;
-  }
+  if (q.empty()) return kNoMatch;
+  const size_t start = find_ci(name, q);
+  if (start == std::string_view::npos) return kNoMatch;
+  const size_t end = start + q.size() - 1;
+  if (q.size() == 1) return single_score(name, start, cap);
   int32_t score = 0, first_bonus = 0;
-  size_t at = start;
   for (size_t k = 0; k < q.size(); ++k) {
-    bool run = false;
-    if (k > 0) {
-      const size_t last = at;
-      at = find_folded(name, last + 1, uint8_t(q[k]));
-      if (at == std::string_view::npos || at > end) return kNoMatch;
-      run = at == last + 1;
-      if (!run) score += kGapStart + int32_t(at - last - 2) * kGapExt;
-    }
+    const size_t at = start + k;
+    const bool run = k > 0;
     const Class prev = at == 0 ? Class::Delim : char_class(uint8_t(name[at - 1]));
     int32_t b = bonus(prev, char_class(uint8_t(name[at])));
     if (run) {
@@ -214,9 +171,8 @@ int32_t fuzzy_capped(std::string_view name, std::string_view q, int32_t cap) {
   // Whole-name and stem matches are what people mean most of the time. A
   // leading dot doesn't count: "zshrc" means ~/.zshrc.
   const size_t off = name.size() > 1 && name[0] == '.';
-  const bool contiguous = end + 1 - start == q.size();
   int32_t placed = 0;
-  if (start == off && contiguous) placed = end + 1 == name.size() ? 100 : end + 1 == stem_end(name, off) ? 80 : 30;
+  if (start == off) placed = end + 1 == name.size() ? 100 : end + 1 == stem_end(name, off) ? 80 : 30;
   return score + std::min(placed, cap) - length_cost(name);
 }
 
@@ -233,15 +189,18 @@ size_t one_edit_prefix(std::string_view w, std::string_view q) {
   size_t i = 0;
   while (i < q.size() && i < w.size() && fold(uint8_t(w[i])) == uint8_t(q[i])) ++i;
   if (i == q.size()) return 0;  // a clean prefix, not a typo
-  if (is_digit(uint8_t(q[i])) || (i < w.size() && is_digit(uint8_t(w[i])))) return 0;
+  const bool query_digit = is_digit(uint8_t(q[i]));
+  const bool name_digit = i < w.size() && is_digit(uint8_t(w[i]));
   const std::string_view rest = q.substr(i + 1);
   const std::string_view after = i + 1 <= w.size() ? w.substr(i + 1) : std::string_view();
-  if (i + 1 < q.size() && i + 1 < w.size() && fold(uint8_t(w[i])) == uint8_t(q[i + 1]) &&
-      fold(uint8_t(w[i + 1])) == uint8_t(q[i]) && starts_fold(w.substr(i + 2), q.substr(i + 2)))
+  if (!query_digit && !name_digit && i + 1 < q.size() && i + 1 < w.size() &&
+      !is_digit(uint8_t(q[i + 1])) && !is_digit(uint8_t(w[i + 1])) &&
+      fold(uint8_t(w[i])) == uint8_t(q[i + 1]) && fold(uint8_t(w[i + 1])) == uint8_t(q[i]) &&
+      starts_fold(w.substr(i + 2), q.substr(i + 2)))
     return q.size();  // swapped
-  if (i < w.size() && starts_fold(after, rest)) return q.size();  // wrong letter
-  if (starts_fold(w.substr(i), rest)) return q.size() - 1;      // extra letter in q
-  if (i < w.size() && starts_fold(after, q.substr(i))) return q.size() + 1;  // missing letter in q
+  if (!query_digit && !name_digit && i < w.size() && starts_fold(after, rest)) return q.size();
+  if (!query_digit && starts_fold(w.substr(i), rest)) return q.size() - 1;
+  if (!name_digit && i < w.size() && starts_fold(after, q.substr(i))) return q.size() + 1;
   return 0;
 }
 
@@ -274,7 +233,6 @@ bool one_edit_away(std::string_view name, std::string_view q) {
   size_t i = 0;
   while (i < n && i < m && fold(uint8_t(name[i])) == uint8_t(q[i])) ++i;
   if (i == n && i == m) return false;  // identical: not a typo
-  if ((i < m && is_digit(uint8_t(q[i]))) || (i < n && is_digit(uint8_t(name[i])))) return false;
   auto same = [&](size_t a, size_t b) {  // name[a..] equals q[b..]
     if (n - a != m - b) return false;
     for (; a < n; ++a, ++b)
@@ -282,11 +240,14 @@ bool one_edit_away(std::string_view name, std::string_view q) {
     return true;
   };
   if (n == m) {
+    if (is_digit(uint8_t(q[i])) || is_digit(uint8_t(name[i]))) return false;
     if (same(i + 1, i + 1)) return true;  // wrong letter
-    return i + 1 < n && fold(uint8_t(name[i])) == uint8_t(q[i + 1]) && fold(uint8_t(name[i + 1])) == uint8_t(q[i]) &&
+    return i + 1 < n && !is_digit(uint8_t(name[i + 1])) && !is_digit(uint8_t(q[i + 1])) &&
+           fold(uint8_t(name[i])) == uint8_t(q[i + 1]) && fold(uint8_t(name[i + 1])) == uint8_t(q[i]) &&
            same(i + 2, i + 2);  // swapped
   }
-  return n > m ? same(i + 1, i) : same(i, i + 1);  // missing / extra letter
+  return n > m ? !is_digit(uint8_t(name[i])) && same(i + 1, i)
+               : !is_digit(uint8_t(q[i])) && same(i, i + 1);
 }
 
 // A whole-name match with one typo: scored as if typed right, minus the
@@ -302,8 +263,6 @@ int32_t whole_typo_score(std::string_view name, std::string_view q) {
 
 bool takes_typos(const Token& t) { return t.mode == Mode::Fuzzy && t.text.size() >= kTypoMinLen; }
 
-bool is_subseq(std::string_view name, std::string_view q) { return subseq_end(name, q) != std::string_view::npos; }
-
 size_t find_ci(std::string_view name, std::string_view q) {
   if (q.size() > name.size()) return std::string_view::npos;
   const size_t last = name.size() - q.size();
@@ -315,7 +274,7 @@ size_t find_ci(std::string_view name, std::string_view q) {
 }
 
 bool token_matches(std::string_view name, const Token& t) {
-  if (t.mode == Mode::Fuzzy) return is_subseq(name, t.text);
+  if (t.mode == Mode::Fuzzy) return find_ci(name, t.text) != std::string_view::npos;
   return token_score(name, ~uint64_t(0), t) != kNoMatch;
 }
 
@@ -651,7 +610,7 @@ struct Scan {
     if (!t.fits(m)) return false;
     bool hit;
     if (t.mode == Mode::Fuzzy) {
-      hit = (t.mask & ~m) == 0 && is_subseq(name, t.text);
+      hit = (t.mask & ~m) == 0 && find_ci(name, t.text) != std::string_view::npos;
       if (!hit && takes_typos(t) && (m & t.start))
         hit = typo_score(name, m, t.text) != kNoMatch || whole_typo_score(name, t.text) != kNoMatch;
     } else {

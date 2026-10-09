@@ -47,6 +47,7 @@ Use macOS on Apple Silicon, a C++20 compiler, PCRE2, and `pkg-config`:
 brew install pcre2 pkgconf
 make            # produces build/fplussearch
 make lib        # produces build/libfplussearch.a for C++ embedding
+make test-search # runs name-matching regression checks
 ```
 
 The library's entry point is `src/live.hpp`. Link with CoreServices and
@@ -117,7 +118,12 @@ and Messages. Other volumes (`/Volumes`) are not indexed.
 
 ## Query syntax
 
-All parts must match. Name matching is a case-insensitive substring match.
+All parts must match. Name matching uses case-insensitive substrings, not scattered letters.
+Words of at least five bytes also allow one wrong, extra, missing, or swapped letter.
+Typo matching preserves digits. At word starts, it also preserves the first letter;
+whole-name typo matches can edit the first letter.
+Whole-name, stem, prefix, and word-boundary matches receive ranking bonuses; typos receive a penalty.
+Prefix a word with `'` to disable typo matching, or `!` to exclude a literal substring.
 
 | Query | Matches |
 | --- | --- |
@@ -132,33 +138,33 @@ In symbol results, Enter prints `path:line`.
 
 ## Performance
 
-On an M4 Pro with 6.35 million files and folders (`build/fplussearch --bench`):
+Median query latency on an M4 Pro with 24 GiB RAM, using folder-local indexes:
 
-| Query | Matches | While typing | First key after a pause |
-| --- | ---: | ---: | ---: |
-| `a` | 3,860,859 | 0.05 ms | 0.07 ms |
-| `size:>1gb type:video` | 0 | 0.06 ms | 0.5 ms |
-| `type:image` | 97,706 | 0.16 ms | 1.3 ms |
-| `readme` | 36,933 | 0.25 ms | 0.7 to 2.6 ms |
-| `node_modules` | 13,956 | 0.22 ms | 0.6 to 2.5 ms |
-| `2024` | 2,427 | 0.32 ms | 1.1 to 2.4 ms |
-| `sym:useEffect` | 985 | 0.24 ms | 2.8 ms |
-| `sym:parse` | 309,109 | 0.43 ms | 3.7 ms |
-| `sym:render ext:tsx` | 414 | 0.62 ms | 7.4 ms |
+| Dataset | Search | Before substring change | Current | fsearch |
+| --- | --- | ---: | ---: | ---: |
+| Linux | Filename | 0.0594 ms | 0.0584 ms | 0.1251 ms |
+| Linux | Content | 1.0061 ms | 1.0499 ms | 2.3338 ms |
+| Chromium | Filename | 0.1358 ms | 0.1457 ms | 0.3578 ms |
+| Chromium | Content | 3.6940 ms | 3.7227 ms | 6.9376 ms |
 
-The pause column varies between runs because it measures how quickly macOS
-wakes idle cores.
+Linux contains 95,939 visible files; Chromium contains 507,057.
+Each engine runs separately for five rounds over a seeded workload.
+Each round contains 300 exact filenames, 1,200 typos, and 67 literal content patterns.
+Times include Unix socket round trips, with 50 results and no content-search time budget.
+These are warm-workload medians, not cold-cache or whole-disk measurements.
+The baseline uses the pre-change matching implementation with the same build dependencies.
 
-Memory:
+Run the comparison with local Linux and Chromium checkouts:
 
-| | |
-| --- | ---: |
-| File index (memory-mapped cache file) | 96 MB |
-| Symbol index, 16.9 million definitions (memory-mapped, read only by `sym:` queries) | 128 MB |
-| Process footprint while searching | 2.4 MB |
-| Peak while indexing | 323 MB |
+```sh
+python3 benchmarks/compare.py ~/fplussearch-bench --fsearch ../fsearch --rounds 5 --out /tmp/fplussearch-benchmark.json
+```
 
-The index pages are clean file-backed memory, so macOS can drop them under
+See [benchmark methodology](benchmarks/README.md) for setup and historical results.
+Raw benchmark JSON files remain local and aren't tracked by Git.
+Timing differences vary between runs and don't establish a consistent speed improvement from the substring change.
+
+Index pages are clean file-backed memory, so macOS can drop them under
 memory pressure and read them back from the cache files.
 
 ## How it works
@@ -176,18 +182,17 @@ memory pressure and read them back from the cache files.
   digits per byte in their own section. A query containing any other
   character skips that section; hex-only queries search the packed bytes
   directly at both nibble alignments.
-- A query scans the name bytes for its longest term with NEON and checks
-  other terms per candidate name. Work is split across all cores in jobs of
-  equal byte size.
+- NEON filters character masks in batches before scoring candidate names.
+  Name scoring uses case-insensitive substrings and one-edit typo matching.
+  Work is split across search threads.
 - Folders come first in the numbering, so a parent fits in 20 bits. Sizes
   are stored only for files, as 32 bits plus a small table for files of
   4 GB or more. Each file has a kind byte holding its type and a size class;
   `type:` and `size:` filters test 16 kind bytes at a time and read exact
   sizes only near a size boundary.
-- One- and two-character queries match most of the disk. The index stores
-  how many entries contain each character and character pair, so these
-  queries read the total from a table and only scan until the screen is
-  full.
+- Search scores distinct names, then ranks their entries using location,
+  recency, and visibility adjustments. Score bounds let it skip candidates
+  that cannot reach the top results while still counting matches.
 - A refresh rebuilds the index from the previous one: folders FSEvents
   reported (and folders new to the index) are listed from disk, everything
   else is copied from the cached index, a whole unchanged subtree at a time.
@@ -211,8 +216,8 @@ memory pressure and read them back from the cache files.
 - Query mode (`fplussearch QUERY`) and `--bench` use the cache as it is;
   only the interactive mode refreshes it. While the interactive mode is open,
   changes can take up to 30 s to appear.
-- Results list folders first, then files, each sorted by name (byte order);
-  they are not ranked by relevance.
+- Filename results are ranked by match quality, location, recency, and visibility.
+  Substring matching doesn't support scattered-letter abbreviations.
 - Symbol extraction is heuristic, not a parser: unusual code can be missed or
   misread. Source files over 1 MB and files that look minified are skipped,
   and only a name's first definition in each file is listed.
@@ -221,12 +226,14 @@ memory pressure and read them back from the cache files.
 
 ```sh
 make
+make test-search
 swift build -Xswiftc -warnings-as-errors
 swift build -c release -Xswiftc -warnings-as-errors
 python3 tests/test_daemon_disconnect.py
 brew style Formula/fplussearch.rb
 ```
 
+`make test-search` checks substring matching, letter edits beside digits, and rejection of digit edits.
 The Python regression check uses an isolated temporary index and daemon.
 It verifies that disconnecting during a large response doesn't stop the daemon.
 It requires Python 3 and a built `build/fplussearch` executable.

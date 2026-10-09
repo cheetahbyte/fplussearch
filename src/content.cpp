@@ -657,6 +657,29 @@ struct ContentIndex::Segment {
     const uint32_t* it = std::lower_bound(key.p, key.p + key.n, t);
     return it != key.p + key.n && *it == t ? size_t(it - key.p) : SIZE_MAX;
   }
+  // Keeps the docs of `acc` (ascending) that varint slot k lists with every
+  // bit of `need`. Equivalent to list() + set_intersection, but decodes in
+  // place without buffers and stops once the list passes acc's last doc.
+  void intersect(size_t k, std::vector<uint32_t>& acc, uint8_t need) const {
+    const uint8_t* p = post.p + (off[k] & ~kBitset);
+    const uint8_t* end = post.p + (off[k + 1] & ~kBitset);
+    const size_t n = acc.size();
+    size_t i = 0, w = 0;
+    uint32_t last = 0, v;
+    while (p < end) {
+      p = get_varint(p, v);
+      last += v;
+      const uint8_t m = *p++;
+      while (acc[i] < last)
+        if (++i == n) goto done;
+      if (acc[i] == last) {
+        if ((m & need) == need) acc[w++] = last;
+        if (++i == n) break;
+      }
+    }
+  done:
+    acc.resize(w);
+  }
   size_t list_bytes(size_t k) const { return (off[k + 1] & ~kBitset) - (off[k] & ~kBitset); }
   bool is_bitset(size_t k) const { return off[k] & kBitset; }
   bool has(size_t k, uint32_t d) const {  // bitset lists only
@@ -1366,7 +1389,6 @@ std::optional<std::vector<uint32_t>> eval(const ContentIndex::Segment& s, const 
     return ca < cb;
   });
   std::optional<std::vector<uint32_t>> acc;
-  std::vector<uint32_t> tmp;
   for (size_t k : slots) {
     if (!acc) {
       acc.emplace();
@@ -1379,11 +1401,7 @@ std::optional<std::vector<uint32_t>> eval(const ContentIndex::Segment& s, const 
       continue;
     }
     if (acc->size() <= 4 && s.list_bytes(k) > 4096) continue;
-    tmp.clear();
-    s.list(k, tmp, need_of(k));
-    std::vector<uint32_t> out;
-    std::set_intersection(acc->begin(), acc->end(), tmp.begin(), tmp.end(), std::back_inserter(out));
-    *acc = std::move(out);
+    s.intersect(k, *acc, need_of(k));
   }
   for (const TQ* c : others) {
     if (acc && acc->empty()) break;

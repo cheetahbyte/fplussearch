@@ -31,6 +31,7 @@ fn main() {
     }
     let idx = Index::build(listings, 0, fsearch::query::now_secs(), root.as_bytes());
     idx.save(&dir.join("index.bin")).unwrap();
+    drop(idx);
     let live = Live::new(Index::load(&dir.join("index.bin")).unwrap());
     let name_ready = started.elapsed().as_secs_f64();
     let mut content = Content::open(dir.join("content"));
@@ -39,6 +40,7 @@ fn main() {
         let id = content.alloc_id();
         content.push(fsearch::content::build_segment(&dir.join("content"), id, &docs, batch).unwrap());
     }
+    drop(docs);
     while let Some(ids) = content.merge_plan() {
         let id = content.alloc_id();
         let segment = fsearch::content::merge(&dir.join("content"), id, &content.segments(&ids)).unwrap();
@@ -47,6 +49,10 @@ fn main() {
     let pool = rayon::ThreadPoolBuilder::new().start_handler(|_| unsafe {
         libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
     }).build().unwrap();
+    unsafe extern "C" {
+        fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+    }
+    unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
     let total_build = started.elapsed().as_secs_f64();
     let listener = UnixListener::bind(dir.join("search.sock")).unwrap();
     eprintln!("ready: {} entries, {} content docs", live.base.n, content.docs());

@@ -18,6 +18,7 @@ constexpr uint32_t kTypeFiles = 0xffff;
 constexpr uint32_t kTypeDir = 1u << 16;
 constexpr uint32_t kTypeAny = kTypeFiles | kTypeDir;
 
+// Fuzzy matches contiguous text and allows typos; Exact disables typos.
 enum class Mode : uint8_t { Fuzzy, Exact, Prefix, Suffix };
 enum class Kind : uint8_t { Any, File, Dir, Link };
 enum class GrepMode : uint8_t { None, Literal, Regex };
@@ -115,7 +116,7 @@ void Engine::each_file(const Index& ix, const Query& q, Take&& take) {
 // files it reads. Size, date and in: are left to the caller.
 bool path_matches(const Query& q, std::string_view path);
 
-// Scoring, exposed for other match sources (the live overlay, content hits).
+// Case-insensitive substring scoring, shared with other match sources.
 int32_t fuzzy_score(std::string_view name, std::string_view q);
 // Score of one token against a name with name_mask `m`, or INT32_MIN.
 int32_t token_score(std::string_view name, uint64_t m, const Token& t);

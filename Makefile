@@ -30,4 +30,10 @@ build:
 clean:
 	rm -rf build
 
-.PHONY: clean lib
+build/test-search-matching: tests/test_search_matching.cpp $(LIBOBJ)
+	$(CXX) $(CXXFLAGS) -Isrc $^ -o $@ $(LDFLAGS)
+
+test-search: build/test-search-matching
+	./build/test-search-matching
+
+.PHONY: clean lib test-search
