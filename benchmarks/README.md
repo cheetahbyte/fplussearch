@@ -1,80 +1,68 @@
-# fplussearch versus fsearch
+# Benchmark fplussearch
 
-These are historical single-pass timing results. See [optimization experiments](optimizations.md) for repeated comparisons and corrected memory measurements.
+[benchmark.py](benchmark.py) measures filename and content query latency using the normal fplussearch executable. It doesn't build or run fsearch, compile Rust, install dependencies, or alter existing daemons.
 
-On this M4 Pro with 24 GiB RAM, fplussearch has lower median latency in both datasets.
-Name search is about 2× faster; content search is about 2.0-3.6× faster.
-These results replace the initial run, whose Rust harness omitted fsearch's release profile.
+## Run
 
-## Results
-
-Times are median socket round-trip milliseconds, including JSON serialization and client parsing.
-The filename workload includes 300 exact names and 1,200 typos per dataset.
-The content workload includes 67 literal patterns per dataset.
-
-| Dataset | Operation | fplussearch | fsearch | fplussearch speedup |
-|---|---|---:|---:|---:|
-| Linux, 95,939 visible files | Name search | 0.106 ms | 0.217 ms | 2.05× |
-| Linux | Content search | 1.413 ms | 5.119 ms | 3.62× |
-| Chromium, 507,057 visible files | Name search | 0.284 ms | 0.562 ms | 1.98× |
-| Chromium | Content search | 6.091 ms | 12.095 ms | 1.99× |
-
-| Dataset | Accuracy | fplussearch | fsearch |
-|---|---|---:|---:|
-| Linux | Exact filename ranked first | 100% | 100% |
-| Linux | Typo target ranked first | 98.75% | 97.75% |
-| Chromium | Exact filename ranked first | 100% | 100% |
-| Chromium | Typo target ranked first | 99.67% | 99.17% |
-
-Across all content patterns, fplussearch returns 97,758 file-pattern pairs on Linux versus fsearch's 94,145.
-On Chromium, it returns 217,994 versus 198,567.
-Every fsearch file-pattern pair also appears in fplussearch's results.
-These counts include repeated files across different patterns; they aren't unique file counts or independently verified recall.
-
-[Raw results](results.json) include p90 latency, queries, patterns, coverage counts, machine details, and source revisions.
-
-## Method
-
-The workload adapts `../fsearch/demo/vs_fff.py`, using random seed 1 and sorted file enumeration.
-It selects filenames unique among files listed by `fd`, then generates swap, deletion, insertion, and substitution typos.
-Typos never alter the first character, matching the original benchmark's restriction.
-Content patterns contain 60 sampled source identifiers and seven fixed patterns.
-The precise queries differ from the published benchmark because its original file enumeration wasn't sorted.
-
-Both engines use fresh, folder-local indexes of the same checkout.
-fplussearch runs its production daemon from `build/fplussearch`.
-fsearch uses its current Rust library through [a socket harness](fsearch-harness.rs), because its daemon always indexes `/`.
-The harness preserves absolute paths with ancestor directory listings and follows fsearch's content-segment merge policy.
-It uses fsearch's user-interactive name-search thread priority, existing dependency lockfile, release profile, and production allocator.
-The current harness releases build buffers and applies fsearch's post-build allocator cleanup.
-The release profile enables optimization level 3, fat link-time optimization, and one codegen unit.
-
-The benchmark now runs one engine process at a time by default.
-The historical results used concurrent processes and alternated request order.
-Each engine returns up to 50 results, with one matching line per file and no content-search time budget.
-Separate unlimited-result requests compare content coverage.
-Measurements start after both content indexes finish and one warmup request per operation completes.
-
-These results describe one workload pass, not confidence intervals or cold-cache performance.
-Different content eligibility policies remain active; content comparisons don't force identical indexed files.
-The Rust harness isn't the complete production daemon, so these aren't production-daemon comparisons.
-Name responses from the Rust harness include paths only; fplussearch also returns metadata.
-Startup time, indexing throughput, memory use, and update latency aren't compared.
-Existing user daemons remain running and can introduce background noise.
-The experiments retain no engine optimization. Pre-existing engine edits are preserved.
-
-## Run the benchmark
-
-From the fplussearch repository, run:
+You need macOS on Apple Silicon, Python 3.9 or later, and `fd` on `PATH`. Build fplussearch using the [project build instructions](../README.md#build), then run from the repository root:
 
 ```sh
-python3 benchmarks/compare.py ~/fplussearch-bench --fsearch ../fsearch --rounds 5
+make -j8
+python3 benchmarks/benchmark.py ~/fplussearch-bench/linux \
+  --binary build/fplussearch \
+  --rounds 5 \
+  --out benchmarks/linux.json
+
+python3 benchmarks/benchmark.py ~/fplussearch-bench/chromium \
+  --binary build/fplussearch \
+  --rounds 5 \
+  --out benchmarks/chromium.json
 ```
 
-You need macOS on Apple Silicon, the project's C++ build dependencies, Rust, Python 3, and `fd`.
-The dataset directory must contain `linux` and `chromium` source trees.
-The script builds both current engines, starts isolated benchmark processes, and writes `benchmarks/results.json`.
-Temporary indexes and processes are removed after the run; existing daemons aren't restarted.
+You can use another source tree with at least 300 eligible unique filenames and enough source identifiers. The runner accepts one folder per invocation and any existing fplussearch executable through `--binary`. Five rounds are the default.
 
-Verification: both datasets completed, filename sanity checks passed, and unlimited coverage requests completed.
-The existing daemon-disconnect regression check also passes.
+It prints two medians in milliseconds: filename and content. Lower is better. JSON includes p50, p90, sample counts, exact-name and typo accuracy, the executable hash, and the full query workload. JSON files under `benchmarks/` aren't tracked by Git.
+
+## Repeat the same workload
+
+Capture a baseline before changing code:
+
+```sh
+make -j8
+cp build/fplussearch /tmp/fplussearch-before
+python3 benchmarks/benchmark.py ~/fplussearch-bench/linux \
+  --binary /tmp/fplussearch-before \
+  --out benchmarks/linux-before.json
+```
+
+After changing and rebuilding fplussearch, replay the saved queries:
+
+```sh
+make -j8
+python3 benchmarks/benchmark.py ~/fplussearch-bench/linux \
+  --binary build/fplussearch \
+  --workload benchmarks/linux-before.json \
+  --out benchmarks/linux-after.json
+```
+
+Keep the dataset unchanged. Record its revision and the baseline source revision separately; executable hashes don't identify source revisions. Replay requires the same folder path and doesn't require `fd`.
+
+## Compatibility with fsearch's benchmark
+
+The workload follows `fsearch/demo/vs_fff.py`: random seed 1, 300 unique ASCII filenames, up to 1,200 letter typos, 60 sampled source identifiers, and seven fixed content patterns. It preserves `fd` enumeration order, rather than the sorted enumeration used by our older [comparison runner](compare.py).
+
+Filename requests use `q` and `limit: 50`. Content requests use `op: grep`, literal mode, 50 results, one match per file, and no time budget. Responses expose `ok`, `hits[].path`, and `files[].path`. Status exposes `content_pending`. These are the request and response fields used by fsearch's harness.
+
+The JSON uses the same `name_ms`, `grep_ms`, `exact_top1`, and `typo_top1` fields, under `fplussearch` instead of `fsearch`. It also records additional statistics and a replayable workload.
+
+The upstream script itself isn't drop-in compatible: it hard-codes fsearch's binary and socket, imports `fff`, and stops its existing daemon. This runner uses the same search workload and protocol without those side effects. It builds a fresh folder-local index through the normal `fplussearch serve --root` command in a temporary home directory.
+
+`fd` ordering can vary between invocations and affect sampled content identifiers. For exact before/after comparisons, use `--workload` instead of regenerating queries. Shared content eligibility and ranking aren't guaranteed across engines.
+
+## Measurement limits
+
+Timing includes Unix socket round trips, JSON serialization, and client parsing. Filename medians combine exact and typo queries. Results are warmed with one request per operation after content indexing finishes. Medians pool timed requests across all rounds.
+
+These aren't cold-cache measurements or indexing benchmarks. The runner doesn't flush the OS cache or stop background processes. Only its own daemon is terminated, and temporary indexes are removed after the run.
+
+The older three-engine runner remains available as [compare.py](compare.py), but isn't required for standalone benchmarking.

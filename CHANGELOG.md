@@ -8,6 +8,7 @@
 
 - Add a reproducible folder-local benchmark against fsearch for Linux and Chromium, with query latency, typo accuracy, and content coverage results.
 - Add isolated baseline comparisons, repeated passes, result-parity checks, and memory observations; match fsearch's production allocator in the benchmark harness.
+- Add a standalone benchmark for the normal fplussearch executable, using fsearch-compatible queries and socket requests with replayable workloads and separate filename/content medians.
 
 - Reduce retained memory after indexing and searches by directly mapping large temporary buffers and releasing grep read buffers after each search.
 - Reduce duplicate grep candidate storage and release oversized daemon request and response buffers after processing.

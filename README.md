@@ -154,13 +154,14 @@ Times include Unix socket round trips, with 50 results and no content-search tim
 These are warm-workload medians, not cold-cache or whole-disk measurements.
 The baseline uses the pre-change matching implementation with the same build dependencies.
 
-Run the comparison with local Linux and Chromium checkouts:
+Benchmark the normal fplussearch executable against either source tree:
 
 ```sh
-python3 benchmarks/compare.py ~/fplussearch-bench --fsearch ../fsearch --rounds 5 --out /tmp/fplussearch-benchmark.json
+python3 benchmarks/benchmark.py ~/fplussearch-bench/linux --binary build/fplussearch --out benchmarks/linux.json
+python3 benchmarks/benchmark.py ~/fplussearch-bench/chromium --binary build/fplussearch --out benchmarks/chromium.json
 ```
 
-See [benchmark methodology](benchmarks/README.md) for setup and historical results.
+See the [benchmark harness guide](benchmarks/README.md) for setup, baseline capture, workload replay, and fsearch compatibility.
 Raw benchmark JSON files remain local and aren't tracked by Git.
 Timing differences vary between runs and don't establish a consistent speed improvement from the substring change.
 
