@@ -4,7 +4,7 @@ Whole-disk file name and code symbol search for macOS in C++. Every keystroke
 searches every file and folder on the disk, or every function and type
 defined in its source files.
 
-Inspired by [Noah's Rust file search engine](https://x.com/itsnoahd/status/2107993727809855570).
+Inspired by [Noah's Rust file search engine](https://x.com/itsnoahd/status/2107993727809855570). Repository: https://github.com/noahdunnagan/fsearch
 
 The code in this repository is entirely AI-generated.
 
