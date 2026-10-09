@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Release temporary filename-index buffers at their last use instead of retaining vector capacity.
+- Parse each source file once per symbol response, preserving hit order and first-definition locations.
+- Traverse small `in:` subtrees directly while retaining global scans for broad scopes.
+- Share live-overlay bitmap pages and map blocks between snapshots, copying only modified blocks.
+- Merge sorted content-document streams during synchronization instead of sorting a combined list.
+- Encode content postings from spans and reuse insertion offsets to reduce temporary buffer overlap.
+
 - Match contiguous, case-insensitive name substrings instead of subsequences, retaining one-edit typo tolerance and match-quality ranking.
 - Allow letter insertions and deletions beside digits while keeping digit edits excluded from typo matching.
 - Add `make test-search` for name-matching regression checks.

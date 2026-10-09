@@ -1,7 +1,9 @@
 # Optimization experiments
 
-No attempted optimization consistently beats the pre-experiment baseline on both datasets. All engine changes from these experiments are reverted.
-The existing, uncommitted posting-intersection change in `src/content.cpp` remains untouched and is included in the baseline.
+This page records earlier, rejected experiments. None consistently beat their baseline on both datasets; their engine changes were reverted.
+The posting-intersection change in `src/content.cpp` was included in that baseline.
+
+For the later buffer, scoped-search, symbol, overlay, and content-index changes, see [indexing and search optimizations](six-optimizations.md).
 
 ## Trials
 

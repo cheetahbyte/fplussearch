@@ -246,6 +246,7 @@ void build_symbols(const Index& ix, const std::string& file, ScanProgress* progr
 
 std::vector<SymbolLocation> locate_symbols(const std::string& path,
                                          const std::vector<std::string_view>& names) {
+  if (names.size() == 1) return {locate_symbol(path, names.front())};
   std::vector<SymbolLocation> locations(names.size());
   if (names.empty()) return locations;
   std::vector<char> buf;
@@ -255,8 +256,12 @@ std::vector<SymbolLocation> locate_symbols(const std::string& path,
   std::vector<Symbol> syms;
   extract_symbols(src, lang_of(slash == std::string::npos ? path : path.substr(slash + 1)), syms);
   std::unordered_map<std::string_view, SymbolLocation> first;
-  first.reserve(syms.size());
-  for (const Symbol& s : syms) first.try_emplace(s.name, SymbolLocation{true, s.line, s.kind});
+  first.reserve(names.size());
+  for (const std::string_view name : names) first.try_emplace(name);
+  for (const Symbol& s : syms) {
+    const auto it = first.find(s.name);
+    if (it != first.end() && !it->second.found) it->second = {true, s.line, s.kind};
+  }
   for (size_t i = 0; i < names.size(); ++i)
     if (const auto it = first.find(names[i]); it != first.end()) locations[i] = it->second;
   return locations;
