@@ -11,6 +11,7 @@
 #include <functional>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 
 #include "store.hpp"
 
@@ -241,6 +242,24 @@ void build_symbols(const Index& ix, const std::string& file, ScanProgress* progr
   meta[kMetaFiles] = fields[kFileFp].size / sizeof(uint64_t);
   old = {};  // unmap before replacing the file
   save_fields(file, kMagic, meta, fields);
+}
+
+std::vector<SymbolLocation> locate_symbols(const std::string& path,
+                                         const std::vector<std::string_view>& names) {
+  std::vector<SymbolLocation> locations(names.size());
+  if (names.empty()) return locations;
+  std::vector<char> buf;
+  std::string_view src;
+  if (!read_file(path, kMaxSourceSize, buf, src)) return locations;
+  const size_t slash = path.rfind('/');
+  std::vector<Symbol> syms;
+  extract_symbols(src, lang_of(slash == std::string::npos ? path : path.substr(slash + 1)), syms);
+  std::unordered_map<std::string_view, SymbolLocation> first;
+  first.reserve(syms.size());
+  for (const Symbol& s : syms) first.try_emplace(s.name, SymbolLocation{true, s.line, s.kind});
+  for (size_t i = 0; i < names.size(); ++i)
+    if (const auto it = first.find(names[i]); it != first.end()) locations[i] = it->second;
+  return locations;
 }
 
 SymbolLocation locate_symbol(const std::string& path, std::string_view name) {
