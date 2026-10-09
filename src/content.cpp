@@ -50,6 +50,11 @@ class PathArena {
     return {bytes_.data() + at, path.size()};
   }
 
+  void clear() {
+    BigVec<char>().swap(bytes_);
+    std::deque<std::string>().swap(overflow_);
+  }
+
  private:
   static constexpr size_t kCapacity = size_t(1) << 30;
   BigVec<char> bytes_;
@@ -158,7 +163,7 @@ bool path_in_scope(std::string_view path, std::string_view home) {
 
 // Opens a regular file without blocking (O_NONBLOCK: a FIFO never hangs
 // open) and reads up to `cap` bytes into `buf`.
-bool read_file(const char* path, std::vector<char>& buf, size_t cap, struct stat* out = nullptr) {
+bool read_file(const char* path, BigVec<char>& buf, size_t cap, struct stat* out = nullptr) {
   const int fd = open(path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
   if (fd < 0) return false;
   struct stat st{};
@@ -180,7 +185,7 @@ bool read_file(const char* path, std::vector<char>& buf, size_t cap, struct stat
   return true;
 }
 
-bool looks_binary(const std::vector<char>& b) {
+bool looks_binary(const BigVec<char>& b) {
   return std::memchr(b.data(), 0, std::min<size_t>(b.size(), 8192)) != nullptr;
 }
 
@@ -581,7 +586,7 @@ std::string trim_line(std::string_view line) {
 }
 
 // Reads one file fresh and collects up to `per_file` matching lines.
-bool match_file(const Matcher& m, const std::string& path, size_t per_file, std::vector<char>& buf, FileMatches& out) {
+bool match_file(const Matcher& m, const std::string& path, size_t per_file, BigVec<char>& buf, FileMatches& out) {
   if (!read_file(path.c_str(), buf, kMaxContentFile * 4) || looks_binary(buf)) return false;
   const std::string_view s(buf.data(), buf.size());
   size_t from = 0, counted = 0, line_no = 1, last_start = std::string_view::npos;
@@ -927,7 +932,7 @@ size_t ContentIndex::bytes() const {
 void ContentIndex::add_docs(std::vector<DocIn>& docs, bool background) {
   if (docs.empty()) return;
   const unsigned threads = std::min(12u, std::max(1u, std::thread::hardware_concurrency()));
-  std::vector<uint32_t> count(size_t(1) << 22, 0);  // reused per shard: trigram -> slot, then count
+  BigVec<uint32_t> count(size_t(1) << 22, 0);  // reused per shard: trigram -> slot, then count
   for (size_t b0 = 0; b0 < docs.size();) {
     size_t b1 = b0;
     for (uint64_t bytes = 0; b1 < docs.size() && (bytes < kBatchBytes || b1 == b0); ++b1) bytes += docs[b1].size;
@@ -935,7 +940,7 @@ void ContentIndex::add_docs(std::vector<DocIn>& docs, bool background) {
     // Read and extract in parallel; each thread keeps its own trigram runs.
     struct Local {
       std::vector<uint32_t> scratch;
-      std::vector<char> buf;
+      BigVec<char> buf;
       BigVec<uint32_t> flat;  // mapped directly, so freeing it returns the memory
     };
     std::vector<Local> locals(threads);
@@ -961,7 +966,7 @@ void ContentIndex::add_docs(std::vector<DocIn>& docs, bool background) {
       r.len = uint32_t(L.flat.size() - r.start);
       r.rank = doc_rank(d.path);
     });
-    for (Local& L : locals) std::vector<uint32_t>().swap(L.scratch), std::vector<char>().swap(L.buf);
+    for (Local& L : locals) std::vector<uint32_t>().swap(L.scratch), BigVec<char>().swap(L.buf);
 
     // Counting sort of (trigram, doc) pairs, a quarter of the trigram space
     // at a time: each doc's trigrams are sorted, so a cursor per doc walks
@@ -1215,11 +1220,13 @@ void ContentIndex::sync(const Index& ix, bool background, ScanProgress* progress
     }
     publish(std::move(next));
   }
-  held.clear();
+  std::vector<Held>().swap(held);
   cur.reset();
   if (progress) progress->source_files.store(todo, std::memory_order_relaxed);
   want.resize(todo);
   add_docs(want, background);
+  std::vector<DocIn>().swap(want);
+  arena.clear();
   maybe_merge();
 }
 
@@ -1413,9 +1420,10 @@ bool make_matcher(const GrepOptions& o, Matcher& m, std::string& error) {
 // Reads `paths` in order on the pool, until `limit` files matched or the
 // budget is spent. Threads claim paths in order, so the result is exactly
 // the first matching files of the read prefix.
-GrepResult verify(Pool& pool, const Matcher& m, const GrepOptions& o, const std::vector<std::string_view>& paths) {
+template <typename PathAt>
+GrepResult verify(Pool& pool, const Matcher& m, const GrepOptions& o, size_t path_count, PathAt path_at) {
   GrepResult r;
-  r.candidates = paths.size();
+  r.candidates = path_count;
   const auto t0 = std::chrono::steady_clock::now();
   std::atomic<size_t> next{0}, found{0}, read{0};
   std::atomic<bool> out_of_time{false};
@@ -1423,7 +1431,7 @@ GrepResult verify(Pool& pool, const Matcher& m, const GrepOptions& o, const std:
   std::vector<std::pair<size_t, FileMatches>> hits;
   const size_t workers = pool.size();
   pool.run(workers, [&](size_t) {
-    thread_local std::vector<char> buf;
+    BigVec<char> buf;
     setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD, IOPOL_MATERIALIZE_DATALESS_FILES_OFF);
     for (;;) {
       if (found.load(std::memory_order_relaxed) >= o.limit) return;
@@ -1433,10 +1441,10 @@ GrepResult verify(Pool& pool, const Matcher& m, const GrepOptions& o, const std:
         return;
       }
       const size_t i = next.fetch_add(1, std::memory_order_relaxed);
-      if (i >= paths.size()) return;
+      if (i >= path_count) return;
       read.fetch_add(1, std::memory_order_relaxed);
       FileMatches fm;
-      if (!match_file(m, std::string(paths[i]), std::max<size_t>(1, o.per_file), buf, fm)) continue;
+      if (!match_file(m, std::string(path_at(i)), std::max<size_t>(1, o.per_file), buf, fm)) continue;
       found.fetch_add(1, std::memory_order_relaxed);
       std::lock_guard lk(mu);
       hits.push_back({i, std::move(fm)});
@@ -1492,16 +1500,19 @@ GrepResult ContentIndex::grep(const GrepOptions& o) const {
     const uint32_t* it = std::lower_bound(bp, bp + s.ndocs, lo, [&](uint32_t d, const std::string& x) { return s.path(d) < x; });
     for (; it != bp + s.ndocs && s.path(*it).starts_with(lo); ++it) take(*it);
   });
+  size_t candidate_count = 0;
+  for (const auto& p : per) candidate_count += p.size();
   std::vector<Cand> cands;
-  for (auto& p : per) cands.insert(cands.end(), p.begin(), p.end());
+  cands.reserve(candidate_count);
+  for (auto& p : per) {
+    cands.insert(cands.end(), p.begin(), p.end());
+    std::vector<Cand>().swap(p);
+  }
   // Your files before dot-folders and logs, then the most recently changed.
   std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) {
     return a.rank != b.rank ? a.rank > b.rank : a.mtime != b.mtime ? a.mtime > b.mtime : a.path < b.path;
   });
-  std::vector<std::string_view> paths;
-  paths.reserve(cands.size());
-  for (const Cand& c : cands) paths.push_back(c.path);
-  return verify(*readers_, m, o, paths);
+  return verify(*readers_, m, o, cands.size(), [&](size_t i) { return cands[i].path; });
 }
 
 GrepResult ContentIndex::grep_files(const GrepOptions& o, const std::vector<std::string>& paths) const {
@@ -1512,7 +1523,7 @@ GrepResult ContentIndex::grep_files(const GrepOptions& o, const std::vector<std:
   for (const auto& p : paths)
     if (!o.keep || o.keep(p)) v.push_back(p);
   std::lock_guard rl(read_m_);
-  return verify(*readers_, m, o, v);
+  return verify(*readers_, m, o, v.size(), [&](size_t i) { return v[i]; });
 }
 
 }  // namespace fplussearch

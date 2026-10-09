@@ -426,7 +426,7 @@ int32_t token_bound(const Token& t, std::string_view name) {
 // cut back to k now and then, cheaper than a heap when most entries match.
 struct TopK {
   size_t k;
-  std::vector<Key> buf;
+  BigVec<Key> buf;
   Key floor = 0;
   explicit TopK(size_t k_) : k(k_), floor(k_ == 0 ? ~Key(0) : 0) {}
   bool full() const { return k > 0 && floor != 0; }
@@ -479,7 +479,7 @@ struct Scan {
   uint32_t now = 0;
   std::array<uint8_t, 256> file_ok{};  // per kind byte: 0 reject, 1 accept, 2 check exact size
   bool no_entry_filters = false;       // every entry of a matching name matches
-  std::vector<DirHit>* dir_hits = nullptr;
+  BigVec<DirHit>* dir_hits = nullptr;
   const std::vector<uint64_t>* dead = nullptr;
 
   Scan(const Index& ix_, const Query& q_) : ix(ix_), q(q_) {
@@ -1053,7 +1053,7 @@ std::vector<Job> make_jobs(const Index& ix, const Scan& sc, size_t target) {
 
 // Fills `hits` with every directory's own token matches, for entries whose
 // tokens are matched by a folder above them.
-void fill_dir_hits(const Index& ix, Scan& sc, Pool& pool, std::vector<DirHit>& hits) {
+void fill_dir_hits(const Index& ix, Scan& sc, Pool& pool, BigVec<DirHit>& hits) {
   hits.assign(ix.dirs, DirHit{});
   std::vector<std::pair<int, std::pair<uint32_t, uint32_t>>> jobs;
   const size_t per = std::max<size_t>(1, (ix.sections[0].block_off[ix.sections[0].blocks()] +
@@ -1080,7 +1080,7 @@ void Engine::each_match(const Index& ix, const Query& q, bool files_only, const 
   Scan sc(ix, q);
   if (sc.scope_missing) return;
   if (files_only) sc.dirs_ok = false;
-  std::vector<DirHit> dir_hits;
+  BigVec<DirHit> dir_hits;
   if (sc.need_dirs) {
     fill_dir_hits(ix, sc, pool_, dir_hits);
     sc.dir_hits = &dir_hits;
@@ -1112,7 +1112,7 @@ Results Engine::search(const Index& ix, const Query& q, size_t limit, const Over
   // New folders aren't in the index yet; their entries are in the overlay.
   const bool scope_new = sc.scope_missing && overlay && !overlay->extras.empty();
   if (sc.scope_missing && !scope_new) return r;
-  std::vector<DirHit> dir_hits;
+  BigVec<DirHit> dir_hits;
   if (sc.need_dirs) {
     fill_dir_hits(ix, sc, pool_, dir_hits);
     sc.dir_hits = &dir_hits;

@@ -214,15 +214,19 @@ bool serve(Live& live, const std::string& sock, const std::string& home) {
         for (size_t nl; (nl = buf.find('\n')) != std::string::npos;) {
           std::string resp = handle_request(live, std::string_view(buf).substr(0, nl), home);
           buf.erase(0, nl + 1);
+          if (buf.capacity() > (64 << 10) && buf.size() < buf.capacity() / 2) {
+            std::string(buf).swap(buf);
+          }
           resp += '\n';
-          // A big answer (a grep over many files) leaves freed memory that
-          // malloc would keep dirty: hand it back. Small answers skip this,
-          // so it never delays a typical search.
-          if (resp.size() > (64 << 10)) malloc_zone_pressure_relief(nullptr, 0);
           for (size_t off = 0; off < resp.size();) {
             const ssize_t w = write(c, resp.data() + off, resp.size() - off);
             if (w <= 0) break;
             off += size_t(w);
+          }
+          const bool large_response = resp.size() > (64 << 10);
+          if (large_response) {
+            std::string().swap(resp);
+            malloc_zone_pressure_relief(nullptr, 0);
           }
         }
       }
