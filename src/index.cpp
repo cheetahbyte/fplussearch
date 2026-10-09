@@ -645,7 +645,7 @@ class Scanner {
       for (uint32_t i = 0; i < set.order.size(); ++i) set.rank[set.order[i]] = i;
       set.first.assign(set.order.size() + 1, 0);
     });
-    used = {};
+    BigVec<uint8_t>().swap(used);
 
     for (size_t e = 0; e < n; ++e) {
       Set& set = sets[kind_[e] == kRawDir ? 0 : 1];
@@ -665,7 +665,7 @@ class Scanner {
       for (size_t f = 0; f < kSectionFields; ++f)
         b.fields[kSections + (2 * s + hex) * kSectionFields + f] = std::move(fields[f]);
     });
-    for (auto& set : sets) set.order = {};
+    for (auto& set : sets) BigVec<uint32_t>().swap(set.order);
 
     BigVec<uint32_t> new_id(n);
     {
@@ -676,7 +676,7 @@ class Scanner {
         new_id[e] = next[size_t(s)][sets[size_t(s)].rank[name_[e]]]++;
       }
     }
-    for (auto& set : sets) set.rank = {};
+    for (auto& set : sets) BigVec<uint32_t>().swap(set.rank);
     lay_out_dirs(b, new_id, dirs);
     names_ = {};  // all name strings are now in the sections
 
@@ -731,7 +731,7 @@ class Scanner {
       b.fields[kCodeEntry] = blob(std::move(code_entry));
       b.fields[kCodeMtime] = blob(std::move(code_mtime));
     }
-    new_id = {};
+    BigVec<uint32_t>().swap(new_id);
     name_.clear();
     parent_.clear();
     size_.clear();
