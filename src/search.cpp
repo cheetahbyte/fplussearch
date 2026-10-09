@@ -439,7 +439,9 @@ struct Scan {
   std::array<uint8_t, 256> file_ok{};  // per kind byte: 0 reject, 1 accept, 2 check exact size
   bool no_entry_filters = false;       // every entry of a matching name matches
   BigVec<DirHit>* dir_hits = nullptr;
-  const std::vector<uint64_t>* dead = nullptr;
+  std::vector<uint32_t> scoped_entries;
+  std::unordered_map<uint32_t, DirHit> scoped_hits;
+  decltype(Overlay::dead) dead = nullptr;
 
   Scan(const Index& ix_, const Query& q_) : ix(ix_), q(q_) {
     for (const Token& t : q.tokens) (t.negate ? neg : pos).push_back(&t);
@@ -521,7 +523,7 @@ struct Scan {
       uint8_t bits = 0;
       std::array<int16_t, 4> best{};
       for (uint32_t a = p;; a = ix.parent(a)) {
-        const DirHit& d = (*dir_hits)[a];
+        const DirHit& d = scoped_entries.empty() ? (*dir_hits)[a] : scoped_hits.at(a);
         if (d.neg) return kNoMatch;
         bits |= d.bits;
         for (size_t t = 0; t < 4; ++t) best[t] = std::max(best[t], d.best[t]);
@@ -984,8 +986,65 @@ Query parse_query(std::string_view text, std::string_view home) {
 
 namespace {
 
+bool prepare_scope(const Index& ix, Scan& sc) {
+  if (sc.scope == UINT32_MAX || sc.scope == 0 || sc.scope_missing) return false;
+  const size_t cap = std::min<size_t>(16384, ix.n / 16);
+  const uint32_t first = ix.dir_pre[sc.scope], end = ix.dir_end[sc.scope];
+  if (end - first > cap) return false;
+  for (uint32_t i = first; i < end; ++i) {
+    const auto kids = ix.kids(ix.dir_order[i]);
+    if (sc.scoped_entries.size() + kids.n > cap) {
+      sc.scoped_entries.clear();
+      return false;
+    }
+    for (uint32_t e : kids) sc.scoped_entries.push_back(e);
+  }
+  if (sc.scoped_entries.empty()) return false;
+  if (sc.need_dirs) {
+    char buf[288];
+    for (uint32_t e : sc.scoped_entries) {
+      for (uint32_t a = ix.parent(e);; a = ix.parent(a)) {
+        auto [it, inserted] = sc.scoped_hits.try_emplace(a);
+        if (!inserted) break;
+        NameHit h;
+        const std::string_view name = ix.name_view(a, buf);
+        sc.name_hit(name, name_mask(name), h);
+        it->second.bits = h.bits;
+        it->second.neg = h.flags & kNameNeg;
+        it->second.best = h.best;
+        if (a == 0) break;
+      }
+    }
+  }
+  return true;
+}
+
+template <typename Visit>
+void scoped_visit(const Index& ix, const Scan& sc, const Job& job, Visit&& visit) {
+  char buf[288];
+  for (uint32_t i = job.a; i < job.b; ++i) {
+    const uint32_t e = sc.scoped_entries[i];
+    if (!sc.entry_ok(e)) continue;
+    NameHit h;
+    if (!sc.names_matter && sc.neg.empty()) {
+      h.flags = kNameOk;
+      visit(e, h);
+      continue;
+    }
+    const std::string_view name = ix.name_view(e, buf);
+    if (sc.name_hit(name, name_mask(name), h) && (h.flags & kNameOk)) visit(e, h);
+  }
+}
+
 std::vector<Job> make_jobs(const Index& ix, const Scan& sc, size_t target) {
   std::vector<Job> jobs;
+  if (!sc.scoped_entries.empty()) {
+    const uint32_t count = uint32_t(sc.scoped_entries.size());
+    const size_t parts = std::min<size_t>(target, std::max<size_t>(1, count / 256));
+    for (size_t j = 0; j < parts; ++j)
+      jobs.push_back({-1, true, uint32_t(count * j / parts), uint32_t(count * (j + 1) / parts)});
+    return jobs;
+  }
   if (!sc.names_matter && sc.neg.empty()) {
     // Filters only: walk entries instead of names.
     for (int s = 0; s < 4; ++s) {
@@ -1040,7 +1099,8 @@ void Engine::each_match(const Index& ix, const Query& q, bool files_only, const 
   if (sc.scope_missing) return;
   if (files_only) sc.dirs_ok = false;
   BigVec<DirHit> dir_hits;
-  if (sc.need_dirs) {
+  const bool selective = prepare_scope(ix, sc);
+  if (sc.need_dirs && !selective) {
     fill_dir_hits(ix, sc, pool_, dir_hits);
     sc.dir_hits = &dir_hits;
   }
@@ -1052,6 +1112,10 @@ void Engine::each_match(const Index& ix, const Query& q, bool files_only, const 
     auto entry = [&](uint32_t e, const NameHit& h) {
       if (sc.entry_ok(e) && sc.entry_score(e, h) != kNoMatch && sc.path_ok(e)) take(e);
     };
+    if (job.section == -1) {
+      scoped_visit(ix, sc, job, entry);
+      return;
+    }
     if (job.entries) {
       for (uint32_t e = job.a; e < job.b; ++e) entry(e, any);
       return;
@@ -1072,7 +1136,8 @@ Results Engine::search(const Index& ix, const Query& q, size_t limit, const Over
   const bool scope_new = sc.scope_missing && overlay && !overlay->extras.empty();
   if (sc.scope_missing && !scope_new) return r;
   BigVec<DirHit> dir_hits;
-  if (sc.need_dirs) {
+  const bool selective = prepare_scope(ix, sc);
+  if (sc.need_dirs && !selective) {
     fill_dir_hits(ix, sc, pool_, dir_hits);
     sc.dir_hits = &dir_hits;
   }
@@ -1102,7 +1167,9 @@ Results Engine::search(const Index& ix, const Query& q, size_t limit, const Over
            f > cur && !shared_floor.compare_exchange_weak(cur, f, std::memory_order_relaxed);) {
       }
     };
-    if (job.entries) {
+    if (job.section == -1) {
+      scoped_visit(ix, sc, job, entry);
+    } else if (job.entries) {
       for (uint32_t e = job.a; e < job.b; ++e) entry(e, any);
     } else {
       size_t since = 0;
