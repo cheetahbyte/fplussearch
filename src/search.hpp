@@ -8,6 +8,7 @@
 
 #include "index.hpp"
 #include "pool.hpp"
+#include "overlay_storage.hpp"
 #include "regex.hpp"
 #include "symindex.hpp"
 
@@ -76,7 +77,7 @@ struct Extra {
 
 // Changes on top of an index: entries gone since, and entries added.
 struct Overlay {
-  const std::vector<uint64_t>* dead = nullptr;  // one bit per index entry
+  DeadView dead;  // one bit per index entry
   std::vector<const Extra*> extras;
 };
 
