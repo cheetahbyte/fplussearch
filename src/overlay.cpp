@@ -74,7 +74,7 @@ void drop_extras(Live::State& s, const std::string& path) {
   s.extras.erase(path);
   const std::string lo = path == "/" ? "/" : path + "/";
   const std::string hi = path == "/" ? "0" : path + "0";  // '0' follows '/'
-  s.extras.erase(s.extras.lower_bound(lo), s.extras.lower_bound(hi));
+  s.extras.erase_range(lo, hi);
 }
 
 }  // namespace
@@ -407,7 +407,7 @@ void Live::apply_dir(State& s, const std::string& dir, bool tree, int depth) {
   const bool in_overlay = ox != s.extras.end() && ox->second->dir;
 
   auto add = [&](const std::string& path, const Listed& l) {
-    s.extras[path] = make_extra(path, l);
+    s.extras.set(path, make_extra(path, l));
     if (!l.dir) return;
     // A new folder: everything under it is new too.
     std::vector<std::string> stack{path};
@@ -421,7 +421,7 @@ void Live::apply_dir(State& s, const std::string& dir, bool tree, int depth) {
         bool skip = false;
         for (const auto& ig : ignore_) skip = skip || under(cp, ig);
         if (skip) continue;
-        s.extras[cp] = make_extra(cp, c);
+        s.extras.set(cp, make_extra(cp, c));
         if (c.dir) stack.push_back(cp);
       }
     }
@@ -491,14 +491,14 @@ void Live::apply_dir(State& s, const std::string& dir, bool tree, int depth) {
         add(path, l);
       } else if (!l.dir && (ix.size(h.e) != l.size || ix.mtime[h.e] != mtime || ix.flags[h.e] != l.flags)) {
         kill(s, h.e);
-        s.extras[path] = make_extra(path, l);
+        s.extras.set(path, make_extra(path, l));
       }
     } else if (h.x) {
       if (h.x->dir != l.dir) {
         drop_extras(s, path);
         add(path, l);
       } else if (!l.dir && (h.x->size != l.size || h.x->mtime != mtime || h.x->flags != l.flags)) {
-        s.extras[path] = make_extra(path, l);
+        s.extras.set(path, make_extra(path, l));
       }
     }
   }

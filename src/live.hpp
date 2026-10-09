@@ -85,11 +85,15 @@ class Live {
   struct State {
     std::shared_ptr<const Index> ix;
     std::shared_ptr<const SymbolIndex> sx;
-    std::vector<uint64_t> dead;                               // index entries gone since
+    DeadWords dead;                               // index entries gone since
     size_t dead_count = 0;
-    std::map<std::string, std::shared_ptr<const Extra>> extras;  // by path
+    OverlayMap<std::shared_ptr<const Extra>> extras;  // by path
     Overlay overlay;                                          // views dead and extras
     uint64_t event_id = 0;                                    // last event applied
+
+    State() = default;
+    State(const State& s)
+        : ix(s.ix), sx(s.sx), dead(s.dead), dead_count(s.dead_count), extras(s.extras), event_id(s.event_id) {}
   };
 
   struct Status {
