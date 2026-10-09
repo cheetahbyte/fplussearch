@@ -43,4 +43,7 @@ struct SymbolLocation {
 // Re-reads the file to find where `name` is defined (not stored in the index).
 SymbolLocation locate_symbol(const std::string& path, std::string_view name);
 
+std::vector<SymbolLocation> locate_symbols(const std::string& path,
+                                         const std::vector<std::string_view>& names);
+
 }  // namespace fplussearch

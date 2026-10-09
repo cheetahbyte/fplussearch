@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstring>
 #include <thread>
+#include <unordered_map>
 
 #include "store.hpp"
 #include "symindex.hpp"
@@ -44,12 +45,29 @@ void hit_json(std::string& out, const Live::State& s, size_t i, const Results& r
 }
 
 void symbols_json(std::string& out, const Live::State& s, const Results& r) {
+  std::vector<std::string> paths;
+  std::vector<std::string_view> names;
+  std::unordered_map<std::string, std::vector<size_t>> files;
+  paths.reserve(r.top.size());
+  names.reserve(r.top.size());
+  for (const uint32_t o : r.top) {
+    paths.push_back(s.ix->path(s.sx->occ[o]));
+    names.push_back(s.sx->symbol(o));
+    files[paths.back()].push_back(paths.size() - 1);
+  }
+  std::vector<SymbolLocation> locations(r.top.size());
+  for (const auto& [path, hits] : files) {
+    std::vector<std::string_view> requested;
+    requested.reserve(hits.size());
+    for (const size_t i : hits) requested.push_back(names[i]);
+    const auto found = locate_symbols(path, requested);
+    for (size_t j = 0; j < hits.size(); ++j) locations[hits[j]] = found[j];
+  }
   out += ",\"hits\":[";
   for (size_t i = 0; i < r.top.size(); ++i) {
-    const uint32_t o = r.top[i];
-    const std::string path = s.ix->path(s.sx->occ[o]);
-    const std::string_view name = s.sx->symbol(o);
-    const SymbolLocation loc = locate_symbol(path, name);
+    const std::string& path = paths[i];
+    const std::string_view name = names[i];
+    const SymbolLocation loc = locations[i];
     if (i) out += ',';
     out += "{\"path\":";
     json_escape(out, path);
