@@ -8,11 +8,79 @@ Inspired by [Noah's Rust file search engine](https://x.com/itsnoahd/status/21079
 
 The code in this repository is entirely AI-generated.
 
-## Build
+## Install with Homebrew
+
+This repository also serves as a custom Homebrew tap through `Formula/`.
+The engine requires macOS on Apple Silicon.
 
 ```sh
-make            # produces build/fplussearch (needs a C++20 compiler)
+brew tap cheetahbyte/fplussearch https://github.com/cheetahbyte/fplussearch.git
+brew install --HEAD cheetahbyte/fplussearch/fplussearch
 ```
+
+The formula builds from `main`; no tagged release is available yet.
+These commands become available after the formula is published to the repository.
+
+Swift clients start the shared daemon automatically. To start it at login:
+
+```sh
+brew services start cheetahbyte/fplussearch/fplussearch
+```
+
+Run services without `sudo`. Don't also run `fplussearch install --login`,
+which installs a separate binary and login item.
+If a daemon is already running, stop it before enabling the Homebrew service.
+To stop the Homebrew service:
+
+```sh
+brew services stop cheetahbyte/fplussearch/fplussearch
+```
+
+For protected folders, grant the installed executable Full Disk Access in
+System Settings > Privacy & Security. Installation doesn't grant access.
+
+## Build
+
+Use macOS on Apple Silicon, a C++20 compiler, PCRE2, and `pkg-config`:
+
+```sh
+brew install pcre2 pkgconf
+make            # produces build/fplussearch
+make lib        # produces build/libfplussearch.a for C++ embedding
+```
+
+The library's entry point is `src/live.hpp`. Link with CoreServices and
+PCRE2; the Swift package doesn't require linking the C++ library.
+
+## Use from Swift
+
+Add this repository as a Swift package dependency and select the `FPlusSearch`
+library product. The package talks to the shared daemon through
+`fplussearch stdio`; install the executable separately with Homebrew or `make`.
+
+See [Swift integration](docs/swift.md) for configuration, asynchronous search,
+index readiness, lifecycle, and sandbox limitations.
+
+## Daemon protocol
+
+`fplussearch stdio --root PATH` starts or connects to the daemon for `PATH`.
+The default root is `/`. Send one JSON object per line; each response is one
+JSON object per line. String request IDs are echoed in responses.
+
+```json
+{"id":"1","op":"status"}
+{"id":"2","q":"readme ext:md","limit":20}
+{"id":"3","q":"sym:parse","limit":20}
+{"id":"4","op":"grep","pattern":"TODO","mode":"literal","limit":20}
+```
+
+Responses include `ok`; failures include `error`. Status includes `ready`,
+`busy`, and `content_pending`. Searches can fail during the first index build.
+Grep responses include `complete`; budget-limited results might be partial.
+Disconnecting a client doesn't stop the daemon.
+
+The protocol is currently unversioned. Use matching client and executable
+revisions until releases define compatibility guarantees.
 
 ## Usage
 
@@ -148,6 +216,20 @@ memory pressure and read them back from the cache files.
 - Symbol extraction is heuristic, not a parser: unusual code can be missed or
   misread. Source files over 1 MB and files that look minified are skipped,
   and only a name's first definition in each file is listed.
+
+## Verify
+
+```sh
+make
+swift build -Xswiftc -warnings-as-errors
+swift build -c release -Xswiftc -warnings-as-errors
+python3 tests/test_daemon_disconnect.py
+brew style Formula/fplussearch.rb
+```
+
+The Python regression check uses an isolated temporary index and daemon.
+It verifies that disconnecting during a large response doesn't stop the daemon.
+It requires Python 3 and a built `build/fplussearch` executable.
 
 ## License
 

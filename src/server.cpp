@@ -199,6 +199,11 @@ bool serve(Live& live, const std::string& sock, const std::string& home) {
   for (;;) {
     const int c = accept(ls, nullptr, nullptr);
     if (c < 0) continue;
+    const int no_sigpipe = 1;
+    if (setsockopt(c, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof no_sigpipe) != 0) {
+      close(c);
+      continue;
+    }
     std::thread([&live, &home, c] {
       std::string buf;
       char chunk[65536];
