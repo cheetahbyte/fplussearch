@@ -324,43 +324,54 @@ bool ext_ok(std::string_view name, const std::vector<std::string>& exts) {
   return false;
 }
 
-uint64_t fit_bits(const uint64_t* planes, uint32_t n, const Token* const* toks, size_t nt) {
-  uint64_t hits = 0;
+template <size_t Width>
+std::array<uint64_t, Width> fit_blocks(const std::array<const uint64_t*, Width>& planes, const Token* const* toks, size_t nt) {
+  std::array<uint64_t, Width> hits{};
   for (size_t t = 0; t < nt; ++t) {
     const Token& token = *toks[t];
     uint64_t mask = token.mask;
-    // Exact/prefix/suffix tokens do not need typo bookkeeping.
+    std::array<uint64_t, Width> required;
+    required.fill(~uint64_t(0));
     if (token.loose == 0) {
-      uint64_t candidate = ~uint64_t(0);
       while (mask) {
-        candidate &= planes[std::countr_zero(mask)];
+        const unsigned bit = std::countr_zero(mask);
+        for (size_t lane = 0; lane < Width; ++lane) required[lane] &= planes[lane][bit];
         mask &= mask - 1;
       }
-      hits |= candidate;
+      for (size_t lane = 0; lane < Width; ++lane) hits[lane] |= required[lane];
       continue;
     }
-    uint64_t required = ~uint64_t(0);
     mask = token.mask & ~token.loose;
     while (mask) {
-      required &= planes[std::countr_zero(mask)];
+      const unsigned bit = std::countr_zero(mask);
+      for (size_t lane = 0; lane < Width; ++lane) required[lane] &= planes[lane][bit];
       mask &= mask - 1;
     }
-    // Track zero and at most one missing class; required classes stay present.
-    uint64_t zero = required, one = required;
+    auto zero = required, one = required;
     mask = token.mask & token.loose;
     while (mask) {
-      const uint64_t present = planes[std::countr_zero(mask)];
-      one = (one & present) | zero;
-      zero &= present;
+      const unsigned bit = std::countr_zero(mask);
+      for (size_t lane = 0; lane < Width; ++lane) {
+        const uint64_t present = planes[lane][bit];
+        one[lane] = (one[lane] & present) | zero[lane];
+        zero[lane] &= present;
+      }
       mask &= mask - 1;
     }
-    uint64_t starts = 0, start = token.start;
+    std::array<uint64_t, Width> starts{};
+    uint64_t start = token.start;
     while (start) {
-      starts |= planes[std::countr_zero(start)];
+      const unsigned bit = std::countr_zero(start);
+      for (size_t lane = 0; lane < Width; ++lane) starts[lane] |= planes[lane][bit];
       start &= start - 1;
     }
-    hits |= zero | (one & starts);
+    for (size_t lane = 0; lane < Width; ++lane) hits[lane] |= zero[lane] | (one[lane] & starts[lane]);
   }
+  return hits;
+}
+
+uint64_t fit_bits(const uint64_t* planes, uint32_t n, const Token* const* toks, size_t nt) {
+  const uint64_t hits = fit_blocks<1>({planes}, toks, nt)[0];
   return n == 64 ? hits : hits & ((uint64_t(1) << n) - 1);
 }
 
@@ -610,11 +621,27 @@ struct Scan {
     for (const Token* t : neg)
       if (nt < toks.size()) toks[nt++] = t;
     const bool all = pos.empty() && (!token_only || nt != neg.size());
+    uint64_t next_hits = 0;
     for (uint32_t blk = a; blk < b; ++blk) {
       const uint32_t u0 = blk * kBlock, un = std::min(kBlock, s.names() - u0);
       const uint64_t* masks = s.mask.p + u0;
       uint64_t hits = all ? (un == 64 ? ~uint64_t(0) : (uint64_t(1) << un) - 1) : 0;
-      if (!all) hits = fit_bits((*s.mask_planes)[blk].data(), un, toks.data(), nt);
+      if (!all) {
+        // Adjacent blocks share token-mask traversal and expose independent
+        // intersections to the compiler.
+        if ((blk - a) % 2 == 0) {
+          if (blk + 1 < b) {
+            const auto pair = fit_blocks<2>({(*s.mask_planes)[blk].data(), (*s.mask_planes)[blk + 1].data()}, toks.data(), nt);
+            hits = pair[0];
+            next_hits = pair[1];
+          } else {
+            hits = fit_bits((*s.mask_planes)[blk].data(), un, toks.data(), nt);
+          }
+        } else {
+          hits = next_hits;
+        }
+        if (un < 64) hits &= (uint64_t(1) << un) - 1;
+      }
       if (!hits) continue;
       const char* bs = s.bytes.p + s.block_off[blk];
       const char* be = s.bytes.p + s.block_off[blk + 1];

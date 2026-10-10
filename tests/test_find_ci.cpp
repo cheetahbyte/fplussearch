@@ -68,6 +68,14 @@ int main() {
       std::cerr << "fit_bits differential mismatch: " << trial << '\n';
       return EXIT_FAILURE;
     }
+    std::array<uint64_t, 64> next_planes;
+    for (auto& plane : next_planes) plane = bits_random();
+    const auto pair = fit_blocks<2>({planes.data(), next_planes.data()}, pointers.data(), nt);
+    if (pair[0] != reference_fit_bits(planes.data(), 64, pointers.data(), nt) ||
+        pair[1] != reference_fit_bits(next_planes.data(), 64, pointers.data(), nt)) {
+      std::cerr << "Paired block differential mismatch: " << trial << '\n';
+      return EXIT_FAILURE;
+    }
   }
   const size_t page = size_t(sysconf(_SC_PAGESIZE));
   void* mapping = mmap(nullptr, page * 3, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
