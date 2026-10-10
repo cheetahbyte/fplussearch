@@ -201,7 +201,7 @@ python3 tests/test_daemon_disconnect.py
 brew style Formula/fplussearch.rb
 ```
 
-`make test-search` checks substring and typo matching, including digit preservation.
+`make test-search` checks substring and typo matching, including digit preservation, randomized NEON/scalar differential cases, and guard-page boundaries.
 The Python check verifies daemon survival after a mid-response disconnect using an isolated temporary index.
 It requires Python 3 and `build/fplussearch`.
 

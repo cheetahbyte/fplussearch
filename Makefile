@@ -33,7 +33,15 @@ clean:
 build/test-search-matching: tests/test_search_matching.cpp $(LIBOBJ)
 	$(CXX) $(CXXFLAGS) -Isrc $^ -o $@ $(LDFLAGS)
 
-test-search: build/test-search-matching
+build/test-find-ci: tests/test_find_ci.cpp src/search.cpp $(wildcard src/*.hpp) $(filter-out build/search.o,$(LIBOBJ))
+	$(CXX) $(CXXFLAGS) -Isrc $< $(filter-out build/search.o,$(LIBOBJ)) -o $@ $(LDFLAGS)
+
+build/test-find-ci-scalar: tests/test_find_ci.cpp src/search.cpp $(wildcard src/*.hpp) $(filter-out build/search.o,$(LIBOBJ))
+	$(CXX) $(CXXFLAGS) -U__ARM_NEON -Isrc $< $(filter-out build/search.o,$(LIBOBJ)) -o $@ $(LDFLAGS)
+
+test-search: build/test-search-matching build/test-find-ci build/test-find-ci-scalar
 	./build/test-search-matching
+	./build/test-find-ci
+	./build/test-find-ci-scalar
 
 .PHONY: clean lib test-search

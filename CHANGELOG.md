@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Replace long-name scalar substring tails with bounded overlapping NEON blocks. Reversed-order Chromium socket medians improve 7-8% and p90 about 19%; Linux socket medians remain unchanged. Add randomized NEON/scalar differential checks and guard-page coverage to `make test-search`. See `benchmarks/profiling/find_ci.md` for measurements and workload-specific regressions.
+
 - Inline ordinary filename counts and keep overflow lookup in a cold helper, preserving the index format and fallback behavior. Reversed-order socket benchmarks improve Chromium filename medians by 2.2-3.6%; Linux socket results are inconclusive. See `benchmarks/README.md#inline-name-counts`.
 
 - Consolidate benchmark reports into `benchmarks/README.md`, organize raw results under `benchmarks/results/`, and update runner output defaults and documentation links.

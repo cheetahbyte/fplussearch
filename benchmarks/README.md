@@ -57,21 +57,40 @@ See `python3 benchmarks/compare.py --help` for options.
 The shared workload uses seed 1, 300 exact filenames, up to 1,200 typos, and 67 literal content patterns.
 Requests return at most 50 results, with one content match per file and no content time budget.
 
-Historical Chromium measurements on Apple M4 Pro:
+Updated comparison on Apple M4 Pro, after pulling fsearch from `76d612f` to `d753915`:
 
-| Metric | fplussearch | fsearch |
+fplussearch includes the uncommitted overlapping NEON tail change on top of `16e0aed`.
+Each engine runs alone, with three rounds per invocation, first in forward order and then reversed order.
+Ranges show the two invocation results, not confidence intervals.
+Both datasets contain 1,500 filename queries and 67 content patterns.
+
+| Dataset and metric | fplussearch | fsearch |
 | --- | ---: | ---: |
-| Exact filename median | 0.105 ms | 0.379-0.380 ms |
-| Content median | 3.23-3.33 ms | 5.09-5.22 ms |
-| Typo top-result accuracy | 99.67% | 99.17% |
-| Cached readiness | 17.87 ms | 12.45 ms |
-| Warmed physical footprint | 138.0-140.7 MiB | 79.5-90.8 MiB |
+| Linux filename median | 0.059-0.064 ms | 0.046-0.048 ms |
+| Linux filename p90 | 0.091-0.094 ms | 0.061-0.073 ms |
+| Chromium filename median | 0.094 ms | 0.081-0.090 ms |
+| Chromium filename p90 | 0.207-0.208 ms | 0.148-0.186 ms |
+| Linux content median | 1.139-1.154 ms | 0.767-0.814 ms |
+| Linux content p90 | 6.350-7.454 ms | 1.499-1.606 ms |
+| Chromium content median | 4.700-5.000 ms | 1.270-1.469 ms |
+| Chromium content p90 | 27.658-27.957 ms | 2.422-2.488 ms |
+| Linux typo top-result accuracy | 98.75% | 97.75% |
+| Chromium typo top-result accuracy | 99.67% | 99.17% |
 
-These are historical workload-specific results, not current-binary or whole-disk guarantees.
+Exact filename top-result accuracy is 100% for both engines on both datasets.
+Each engine's ordered filename and content response digests match between invocation orders.
+This checks repeatability within each engine, not result equivalence between engines.
+
+Content file counts differ for 21 of 67 Linux patterns and 59 of 67 Chromium patterns.
+Content timing is therefore not an equal-recall comparison.
 fplussearch runs its full daemon, watcher, and symbol index; fsearch runs a library harness without equivalent lifecycle work.
-Content coverage differs for 54 of 67 patterns, so content timing is not an equal-recall comparison.
-Startup and memory figures do not compare equivalent services. Earlier gigabyte-scale fsearch harness footprints were build-buffer retention artifacts.
-Raw measurements remain in `results/chromium-vs-fsearch-current.json` when available locally.
+Startup and memory figures do not compare equivalent services.
+The fsearch checkout remains clean after the update and benchmark.
+
+Raw measurements: `results/fsearch-updated-{forward,reverse}.json` and `results/fsearch-updated-summary.json`.
+The summary records the fplussearch executable hash because its working-tree optimization is not represented by the commit alone.
+Historical measurements remain in `results/chromium-vs-fsearch-current.json` when available locally.
+These are workload-specific results, not whole-disk guarantees.
 
 ## Retained optimizations
 
@@ -169,6 +188,16 @@ Query-local directory bitmaps avoid repeated ancestor walks for global negation-
 Socket medians improve 29-31% on Linux and 48-49% on Chromium; full-disk engine latency improves about 75% for this class.
 Ordinary filename latency and whole-daemon memory changes remain inconclusive.
 
+### Overlapping substring tails
+
+One bounded NEON block replaces the scalar remainder for multi-byte substring searches with at least 16 possible starts.
+Annotated baseline assembly attributes about 51% of `find_ci` self samples to the scalar tail, versus 8% to setup.
+Captured-input replay improves 17% on Linux and 46% on Chromium.
+Reversed-order Chromium socket runs improve overall medians 7-8% and p90 about 19%; Linux socket medians remain unchanged.
+Linux engine medians regress 2-4%, and Chromium short-query p90 regresses, so the improvement is workload-dependent.
+Needle hoisting and rare-probe selection are not retained.
+See the [substring tail measurements](profiling/find_ci.md) for inputs, methods, correctness checks, and limitations.
+
 ### Other retained changes
 
 - Eight ranked-search jobs per worker instead of 24: Linux filename socket medians improve about 24-25%. Chromium validation was incomplete.
@@ -202,7 +231,7 @@ These changes do not establish a consistent whole-process memory or content-buil
 
 The [three-position substring experiment](results/find-ci-experiment/README.md) records counters, the prototype, and repeated latency comparisons.
 The third probe rejects 71% of eligible NEON survivors on Linux and 82% on Chromium, but overall socket medians increase 0.5-1.0%.
-Short filenames never enter NEON. Long-filename gains are small or reverse with invocation order; the production matcher remains unchanged.
+Short filenames never enter NEON. Long-filename gains are small or reverse with invocation order; the third probe is not retained.
 
 The [substring caller investigation](results/find-ci-callers-experiment/README.md) separates clean scoring, typo scoring, and other searches.
 Typo scoring accounts for 0.127% of substring calls on Linux and 0.046% on Chromium in the same filename workloads.
