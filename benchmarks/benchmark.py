@@ -80,7 +80,7 @@ def main():
     parser.add_argument("folder", type=Path)
     parser.add_argument("--binary", type=Path, default=Path("build/fplussearch"), help="existing executable; this runner never builds it")
     parser.add_argument("--rounds", type=int, default=5)
-    parser.add_argument("--out", type=Path, default=Path("benchmarks/fplussearch-results.json"))
+    parser.add_argument("--out", type=Path, default=Path("benchmarks/results/fplussearch-results.json"))
     parser.add_argument("--workload", type=Path, help="replay the workload from a previous benchmark JSON file")
     args = parser.parse_args()
     root, binary = args.folder.resolve(), args.binary.resolve()

@@ -13,7 +13,8 @@ make -f benchmarks/profiling/Makefile -j8
 This creates `build/profiling/fplussearch`, `build/profiling/replay`, and their debug-symbol bundles. Compilation keeps `-O3 -mcpu=native` and adds `-g`. It does not replace `build/fplussearch`.
 
 It also creates `build/profiling/measure` for unprofiled engine latency measurements.
-The [performance experiment report](../performance-experiments.md#reproduce-engine-comparisons) describes classified workloads, response captures, and reversed-order comparisons.
+Use `workload.py` to generate classified workloads and `measure --help` for engine measurement options.
+See the [benchmark guide](../README.md#repeating-workloads---workload) for comparison rules.
 
 ## Profile the daemon
 
@@ -75,4 +76,5 @@ SVG files are self-contained and interactive. Open one in a browser, select a fr
 
 Flamegraph width represents sampled CPU weight, not individual request latency. Long or expensive queries contribute more width. User stacks ending at a syscall do not reveal kernel internals or off-CPU waits.
 
-Use an unprofiled three-round benchmark to accept a change. Profiling perturbs scheduling and cannot establish a latency improvement itself. The recorded findings and flamegraphs are in [the profiling report](../profiles/README.md).
+Use an unprofiled three-round benchmark to accept a change. Profiling perturbs scheduling and cannot establish a latency improvement itself.
+See the [consolidated findings](../README.md#cpu-profile-findings). Local flamegraphs remain in `../profiles/`.

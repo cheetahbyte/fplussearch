@@ -1,274 +1,140 @@
-# Benchmark & Profiling Guide
+# Benchmarks
 
-This document consolidates instructions for running benchmarks and profiling `fplussearch`, the tooling workflow, verified performance optimizations, CPU profiling findings, and historical experiment outcomes.
+Run commands from the repository root. Requirements: macOS on Apple Silicon, Python 3.9+, and `fd` on `PATH`.
 
----
+## Directory layout
 
-## Table of Contents
+- `benchmark.py`: standalone filename and content latency runner.
+- `compare.py`, `common.py`, `fsearch-harness.rs`: comparison runner and shared tooling.
+- `profiling/`: engine measurement and CPU profiling tools. See the [profiling guide](profiling/README.md).
+- `results/`: raw JSON and replay workloads, ignored except for retained content experiment data.
+- `profiles/`: ignored local CPU captures and flamegraphs.
 
-1. [Running Benchmarks](#running-benchmarks)
-   - [Basic Benchmark Runner (`benchmark.py`)](#basic-benchmark-runner-benchmarkpy)
-   - [Repeating Workloads (`--workload`)](#repeating-workloads---workload)
-   - [Compatibility with upstream `fsearch`](#compatibility-with-upstream-fsearch)
-   - [Measurement Rules & Limits](#measurement-rules--limits)
-2. [Classified Workloads & Engine Benchmarking](#classified-workloads--engine-benchmarking)
-3. [Profiling Tools & Workflow](#profiling-tools--workflow)
-   - [Build with Symbols](#build-with-symbols)
-   - [Profile Daemon over Socket](#profile-daemon-over-socket)
-   - [Profile Engine Directly](#profile-engine-directly)
-   - [Export Stacks & Render Flamegraphs](#export-stacks--render-flamegraphs)
-   - [Flamegraph Directory Index](#flamegraph-directory-index)
-4. [Verified Optimizations & Results](#verified-optimizations--results)
-   - [Bit-Sliced Candidate Masks](#bit-sliced-candidate-masks)
-   - [Bounded Substring Matching](#bounded-substring-matching)
-   - [Ancestor-Exclusion Bitmaps for Negation Queries](#ancestor-exclusion-bitmaps)
-   - [Six Core Architectural & Indexing Optimizations](#six-core-architectural--indexing-optimizations)
-   - [Worker Pool Task Granularity](#worker-pool-task-granularity)
-5. [CPU Profiles & Bottleneck Analysis](#cpu-profiles--bottleneck-analysis)
-6. [Rejected Experiments Log](#rejected-experiments-log)
+## Run benchmarks
 
----
-
-## Running Benchmarks
-
-### Basic Benchmark Runner (`benchmark.py`)
-
-[benchmark.py](benchmark.py) measures filename and content query latency using the standard `fplussearch` executable over a local Unix domain socket. It does not build external tools, compile Rust, or alter existing system daemons.
-
-**Prerequisites:** macOS on Apple Silicon, Python 3.9+, and `fd` on `PATH`.
-
-Build `fplussearch` and run:
+Build and measure a source tree:
 
 ```sh
 make -j8
 python3 benchmarks/benchmark.py ~/fplussearch-bench/linux \
-  --binary build/fplussearch \
-  --rounds 5 \
-  --out benchmarks/linux.json
-
-python3 benchmarks/benchmark.py ~/fplussearch-bench/chromium \
-  --binary build/fplussearch \
-  --rounds 5 \
-  --out benchmarks/chromium.json
+  --binary build/fplussearch --rounds 3 \
+  --out benchmarks/results/linux.json
 ```
 
-- Any source tree with at least 300 eligible unique filenames and enough source identifiers can be used.
-- The runner reports two medians in milliseconds: **filename** and **content**. Lower is better.
-- JSON output includes p50, p90, sample counts, exact-name and typo top-1 accuracy, executable hash, and the full replayable workload.
+Use a tree with at least 300 eligible unique filenames and enough source identifiers.
+The runner reports filename and content medians, p90, top-result accuracy, executable hashes, and replayable workloads.
+Times include socket transport, JSON serialization, and Python response parsing.
+The runner starts an isolated daemon; it does not stop existing daemons or flush the OS page cache.
 
-### Repeating Workloads (`--workload`)
+## Repeating workloads (`--workload`)
 
-To perform exact A/B comparisons without query variation:
-
-1. Capture a baseline workload:
-   ```sh
-   make -j8
-   cp build/fplussearch /tmp/fplussearch-before
-   python3 benchmarks/benchmark.py ~/fplussearch-bench/linux \
-     --binary /tmp/fplussearch-before \
-     --rounds 3 \
-     --out benchmarks/linux-before.json
-   ```
-
-2. After making changes and rebuilding, replay the saved workload:
-   ```sh
-   make -j8
-   python3 benchmarks/benchmark.py ~/fplussearch-bench/linux \
-     --binary build/fplussearch \
-     --rounds 3 \
-     --workload benchmarks/linux-before.json \
-     --out benchmarks/linux-after.json
-   ```
-
-Replaying requires the same source folder path, guarantees identical query sequences, and does not require `fd`.
-
-### Compatibility with upstream `fsearch`
-
-The workload follows `fsearch/demo/vs_fff.py`:
-- Random seed 1.
-- 300 unique ASCII filenames and up to 1,200 letter typos.
-- 60 sampled source identifiers and 7 fixed content patterns.
-- Filename requests use `q` and `limit: 50`. Content requests use `op: grep`, literal mode, 50 results, 1 match per file, and no time budget.
-- Output JSON exposes identical fields: `name_ms`, `grep_ms`, `exact_top1`, and `typo_top1`.
-
-The older multi-engine comparison runner remains available at [compare.py](compare.py).
-
-### Measurement Rules & Limits
-
-- **Timing scope:** Timing includes Unix socket round trips, JSON serialization, and client parsing. Engine-level execution alone is significantly faster.
-- **Rounds limit:** Invocations should remain at **3 rounds or fewer** for candidate evaluations to avoid excessive cache effects.
-- **Run order:** Always run alternating and reversed-order comparisons (e.g. baseline then updated, followed by updated then baseline) to verify gains are not artifacts of thermal state or OS caching.
-- **Daemon isolation:** The runner starts a temporary daemon with `--root` in a temporary home directory. It does not stop background daemons or flush the OS disk cache.
-
----
-
-## Classified Workloads & Engine Benchmarking
-
-For deeper inspection into specific query types without socket overhead, use the classified workload tools:
-
-- Workload generator: `benchmarks/profiling/workload.py` generates queries split into categories (short queries, exact, typos, multi-token, negation-only, etc.).
-- Engine measurement tool: `build/profiling/measure` tests `Engine::search` directly against an immutable index file, capturing p50/p90, total CPU time, peak resident memory, and ordered response digests.
-
----
-
-## Profiling Tools & Workflow
-
-### Build with Symbols
-
-To profile without compromising optimizations (`-O3 -mcpu=native -g`):
+Preserve the baseline executable and workload before changing the engine:
 
 ```sh
-make -f benchmarks/profiling/Makefile -j8
+cp build/fplussearch /tmp/fplussearch-before
+python3 benchmarks/benchmark.py ~/fplussearch-bench/linux \
+  --binary /tmp/fplussearch-before --rounds 3 \
+  --out benchmarks/results/linux-before.json
 ```
 
-This builds `build/profiling/fplussearch`, `build/profiling/replay`, `build/profiling/measure`, and their debug symbol bundles (`.dSYM`).
-
-### Profile Daemon over Socket
-
-Profile an isolated daemon replaying a saved benchmark workload:
+After rebuilding, replay the same workload:
 
 ```sh
-python3 -B benchmarks/profiling/socket_replay.py \
-  build/profiling/fplussearch WORKLOAD.json /tmp/fplussearch-profile
+python3 benchmarks/benchmark.py ~/fplussearch-bench/linux \
+  --binary build/fplussearch --rounds 3 \
+  --workload benchmarks/results/linux-before.json \
+  --out benchmarks/results/linux-after.json
 ```
 
-This records separate 12-second traces for filename and content queries while the daemon is actively serving requests.
+Replay requires the same source folder path but does not require `fd`.
+Use at most three rounds per candidate invocation, repeat in reversed variant order, and check ordered results before accepting gains.
+Diagnostic allocation probes and CPU profiles are not latency evidence.
 
-### Profile Engine Directly
+## Compare with fsearch
 
-Profile continuous in-memory search without socket or JSON overhead:
+`compare.py` builds a folder-local fsearch library harness. It requires a local fsearch checkout and Rust tooling.
+See `python3 benchmarks/compare.py --help` for options.
+The shared workload uses seed 1, 300 exact filenames, up to 1,200 typos, and 67 literal content patterns.
+Requests return at most 50 results, with one content match per file and no content time budget.
 
-```sh
-xctrace record --template 'Time Profiler' --time-limit 15s \
-  --output /tmp/engine.trace --no-prompt --launch -- \
-  build/profiling/replay INDEX.bin QUERIES.txt 8 12
-```
+Historical Chromium measurements on Apple M4 Pro:
 
-### Export Stacks & Render Flamegraphs
+| Metric | fplussearch | fsearch |
+| --- | ---: | ---: |
+| Exact filename median | 0.105 ms | 0.379-0.380 ms |
+| Content median | 3.23-3.33 ms | 5.09-5.22 ms |
+| Typo top-result accuracy | 99.67% | 99.17% |
+| Cached readiness | 17.87 ms | 12.45 ms |
+| Warmed physical footprint | 138.0-140.7 MiB | 79.5-90.8 MiB |
 
-1. Export the trace from Xcode's schema:
-   ```sh
-   xctrace export --input /tmp/engine.trace \
-     --xpath '/trace-toc/run[@number="1"]/data/table[@schema="time-profile"]' \
-     --output /tmp/engine.xml
-   ```
+These are historical workload-specific results, not current-binary or whole-disk guarantees.
+fplussearch runs its full daemon, watcher, and symbol index; fsearch runs a library harness without equivalent lifecycle work.
+Content coverage differs for 54 of 67 patterns, so content timing is not an equal-recall comparison.
+Startup and memory figures do not compare equivalent services. Earlier gigabyte-scale fsearch harness footprints were build-buffer retention artifacts.
+Raw measurements remain in `results/chromium-vs-fsearch-current.json` when available locally.
 
-2. Convert to folded stack format:
-   ```sh
-   python3 -B benchmarks/profiling/export_stacks.py \
-     /tmp/engine.xml benchmarks/profiles/engine --start 1 --end 12
-   ```
-   This generates `all.folded`, `query.folded`, and `summary.json`.
+## Retained optimizations
 
-3. Render an interactive SVG using [FlameGraph](https://github.com/brendangregg/FlameGraph):
-   ```sh
-   curl -fsSL https://raw.githubusercontent.com/brendangregg/FlameGraph/master/flamegraph.pl -o /tmp/flamegraph.pl
-   perl /tmp/flamegraph.pl --countname nanoseconds --hash \
-     benchmarks/profiles/engine/all.folded > benchmarks/profiles/engine/all.svg
-   ```
+### Bit-sliced candidate masks
 
-### Flamegraph Directory Index
+Immutable index-owned bit planes replace linear candidate-mask scans while preserving raw masks, matching semantics, and disk format.
+Repeated three-round socket comparisons reduce filename medians by 6-11% on Linux and 17-18% on Chromium.
+Planes add 512 bytes per block of up to 64 names, plus allocation metadata.
+Construction latency and whole-daemon memory impact were not measured. No content speedup is established.
 
-Saved captures in `benchmarks/profiles/`:
-- `chromium-median-engine/`: Median-band filename queries on Chromium ([all.svg](profiles/chromium-median-engine/all.svg), [query.svg](profiles/chromium-median-engine/query.svg))
-- `chromium-engine/`: Full filename query workload on Chromium ([all.svg](profiles/chromium-engine/all.svg), [query.svg](profiles/chromium-engine/query.svg))
-- `linux-daemon-filename/`: Daemon filename queries on Linux ([all.svg](profiles/linux-daemon-filename/all.svg), [query.svg](profiles/linux-daemon-filename/query.svg))
-- `linux-daemon-content/`: Daemon content queries on Linux ([all.svg](profiles/linux-daemon-content/all.svg), [query.svg](profiles/linux-daemon-content/query.svg))
-- `bitplanes-linux-filename/`, `bitplanes-linux-content/`, `bitplanes-chromium-filename/`, `bitplanes-chromium-content/`: Post-bitplane profiles.
+### Bounded substring matching
 
----
+First/last-byte filtering uses bounded ARM NEON loads with a scalar fallback.
+Repeated Chromium comparisons reduce filename median latency by 3-6% and p90 by about 15%.
+Linux results are inconclusive. Synthetic matcher speedups do not establish equivalent end-to-end gains.
 
-## Verified Optimizations & Results
+### Ancestor-exclusion bitmaps
 
-### Bit-Sliced Candidate Masks
+Query-local directory bitmaps avoid repeated ancestor walks for global negation-only queries.
+Socket medians improve 29-31% on Linux and 48-49% on Chromium; full-disk engine latency improves about 75% for this class.
+Ordinary filename latency and whole-daemon memory changes remain inconclusive.
 
-Candidate mask evaluation originally scanned 64-bit masks linearly per name. The engine replaces this with **index-owned bit planes**:
-- Each section stores 64 planes of 64 bits per block of up to 64 names.
-- Candidate evaluation computes required-bit intersections and start-bit unions across planes using SIMD bitwise operations, identifying names missing 0 or 1 bit for typo acceptance.
-- Disk format and matching semantics (`Token::fits`) remain unchanged.
+### Other retained changes
 
-**Socket Benchmark Results (3-round replays):**
+- Eight ranked-search jobs per worker instead of 24: Linux filename socket medians improve about 24-25%. Chromium validation was incomplete.
+- Release indexing scratch buffers at last use.
+- Parse symbol hits once per file and response snapshot.
+- Traverse narrow `in:` subtrees directly.
+- Share overlay pages and blocks until mutation.
+- Merge sorted content-document streams and pass posting spans without intermediate copies.
 
-| Dataset | Baseline Median | Updated Median | Delta (Forward) | Repeated Baseline | Repeated Updated | Delta (Reversed) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| **Linux** | 70.7 µs | 66.4 µs | **-6.1%** | 72.3 µs | 64.6 µs | **-10.7%** |
-| **Chromium** | 126.1 µs | 103.8 µs | **-17.7%** | 126.6 µs | 104.5 µs | **-17.4%** |
+These changes do not establish a consistent whole-process memory or content-build throughput improvement.
 
-### Bounded Substring Matching
+## Rejected experiments
 
-Filename scoring heavily relies on case-insensitive substring searching (`find_ci`).
-- Vectorized endpoint prefiltering: checks both the **first and last query bytes** simultaneously across 16 positions using ARM NEON before verifying survivors in increasing position order.
-- Loads are strictly bounded to the supplied string view (no out-of-bounds padding reads).
-- Scalar fallback also applies endpoint filtering.
+| Experiment | Reason not retained |
+| --- | --- |
+| Filter-plan precomputation; single-token NEON masks | Gains disappear or reverse with run order |
+| Lazy prefix ranking; progressive prefix expansion | Inconsistent latency or worse Chromium tails |
+| Fewer filename jobs or threads; caller-only search | No repeatable gain or larger-dataset regressions |
+| Typo-bound pruning; worker counter/publishing changes | Inconsistent gains |
+| Claim four jobs at a time | Filename medians regress |
+| Full ancestor-score propagation | Directory prepass costs exceed saved traversal |
+| Selective filename trigram sidecars | Larger-dataset gains do not justify memory and attachment costs |
+| Reusable result scratch | Fewer allocations without repeatable socket gains |
+| Incremental reads; geometric buffer growth; fewer content readers | Inconsistent medians or worse tails |
+| Full content posting intersection | Gains reverse with run order; additional pre-refresh freshness regression |
+| Cross-query content buffers | Inconsistent latency and higher peak memory |
+| Reader-local path strings | Fewer allocations but slower warmed medians |
+| ThinLTO default | Small Chromium benefit; Linux inconclusive, no flag change retained |
+| Linux-trained PGO with ThinLTO | Full-disk query classes and p90 regress |
 
-**Socket Benchmark Results (3-round replays):**
+The retained [content experiment data](results/content-experiments.json) includes measurements, replay sources, and the freshness fixture.
+A content K-way merge was investigated but not implemented: sorting was not the measured bottleneck.
+Naive worker-batch reuse can race with workers leaving the claim loop; fewer allocations alone do not justify it.
 
-| Dataset | Baseline Median | Updated Median | Baseline p90 | Updated p90 | p90 Reduction |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| **Linux** | 64.8 µs | 66.5 µs (+2.6%) | 80.4 µs | 81.5 µs | flat |
-| **Linux (Reversed)** | 68.6 µs | 67.0 µs (-2.4%) | 81.5 µs | 80.0 µs | -1.8% |
-| **Chromium** | 106.4 µs | 100.5 µs (**-5.5%**) | 284.5 µs | 239.8 µs | **-15.7%** |
-| **Chromium (Reversed)** | 104.0 µs | 100.8 µs (**-3.1%**) | 279.8 µs | 237.0 µs | **-15.3%** |
+## CPU profile findings
 
-Microbenchmark comparisons on synthetic patterns show dramatic reduction on difficult inputs (e.g. repeated first-character needles drop from 868 ns to 14.7 ns per call; misses drop from 85 ns to 19 ns).
+After bit-plane filtering, Linux filename query stacks concentrate in candidate filtering and fuzzy scoring.
+Chromium filename stacks concentrate in substring and fuzzy scoring.
+Content verification spends about 89-92% of query-stack sampled weight in file reads, mostly file opens; posting intersection is below 0.1%.
+These profiles are time-weighted CPU observations, not request-latency decompositions or proof that caching would help.
+Scheduler yields during socket pauses reflect the intentional warm-worker policy.
 
-### Ancestor-Exclusion Bitmaps
-
-For global queries with negative tokens and no positive tokens (e.g. `!test`, `type:file !test`, `ext:cpp !third_party`):
-- Instead of repeatedly walking parent pointers up directory chains for each candidate, the engine builds a query-local **ancestor-exclusion bitmap** in directory preorder.
-- A single bit lookup per candidate directory replaces parent-chain traversals.
-
-**Results:**
-- **Linux socket median:** 29–31% faster on negation-only queries.
-- **Chromium socket median:** 48–49% faster on negation-only queries.
-- **Full-disk engine latency:** ~75% reduction on negation-only query classes.
-
-### Six Core Architectural & Indexing Optimizations
-
-1. **Buffer release:** Scratch buffers in filename indexing are released at last use using empty-vector swap instead of empty initializer assignment (which retained capacity).
-2. **Symbol batching:** Symbol hits are grouped by file and parsed once per response snapshot rather than repeatedly per match.
-3. **Narrow `in:` scopes:** Traverses narrow subtrees directly if candidate limit is < 16,384 entries or < 1/16th of the index.
-4. **Copy-on-write overlay:** Deletion-bitmap pages and sorted overlay blocks are shared between snapshots, copying only modified pages.
-5. **Sorted stream merge:** Content synchronization merges sorted segment document streams directly, eliminating redundant combined document sorts.
-6. **Zero-copy posting spans:** Posting spans pass directly to the segment writer, eliminating intermediate copies and auxiliary offset arrays.
-
-### Worker Pool Task Granularity
-
-Reducing `Engine::search` task splitting from 24 jobs per worker to **8 jobs per worker** lowered coordination and container merging overhead, reducing Linux filename socket median from ~0.070 ms to ~0.052 ms (~24% reduction).
-
----
-
-## CPU Profiles & Bottleneck Analysis
-
-Captures profiling the engine after bit-plane filtering show the following distribution:
-
-| Dataset / Workload | Search Median | Primary Hotspot | Profile Evidence |
-| --- | ---: | --- | --- |
-| **Linux Filename** | ~0.060 ms | Candidate-mask filtering & fuzzy scoring | `fit_bits` ~34.8% of query stack; name matching ~25.2%. |
-| **Chromium Filename** | ~0.103 ms | Substring & fuzzy scoring | `name_hit` ~57.0%; `token_score` ~51.8%; `fuzzy_capped` ~45.0%. |
-| **Linux Content** | ~1.12 ms | File access during verification | `read_file` 91.8% (`__open` 80.5%, `read` 7.2%). |
-| **Chromium Content** | ~4.39 ms | File access during verification | `read_file` 88.8% (`__open` 79.2%, `read` 5.9%). |
-
-- In content search, trigram posting list intersection consumes <0.1% of CPU. Fresh filesystem file verification dominates content query latency.
-- In filename search on Linux daemons, scheduler yields (`swtch_pri`) account for ~62% of whole-process CPU during inter-query socket pauses, which is expected behavior for keeping performance-core clusters warm.
-
----
-
-## Rejected Experiments Log
-
-To prevent re-investigating dead ends, the following ideas were evaluated and rejected due to lack of repeatable gains or regressions:
-
-| Trial | Rationale / Result | Decision |
-| --- | --- | --- |
-| **Query filter-plan precomputation** | Building precomputed bit-plane indices and branching exact intersection per token produced no repeatable latency gain (<1.5% noise that reversed on second run). | **Rejected** |
-| **Single-token NEON mask filtering** | Initial Chromium improvement vanished when reversing benchmark variant run order. | **Rejected** |
-| **Eager prefix ranking / lazy sort** | Sorting candidates lazily produced inconsistent latencies and worse Chromium p90. | **Rejected** |
-| **Progressive prefix expansion** | Better medians in one run, but regressed Chromium average and p90. | **Rejected** |
-| **Reducing filename jobs to 4 per worker** | Worse Chromium tail latency. 8 jobs per worker proved optimal. | **Rejected** |
-| **Incremental chunk reading (64 KiB)** | Reading content files in small chunks improved mean slightly but did not lower medians. | **Rejected** |
-| **Geometric buffer growth (8 KiB start)** | Regressed Chromium content average latency. | **Rejected** |
-| **Selective single-threaded search on caller** | Large Chromium regression due to lost multi-core parallelism. | **Rejected** |
-| **Reducing content reader threads (to 4 or 8)** | Inconsistent medians and worse tail latency. | **Rejected** |
-| **Typo score bound pruning skips** | Skipping typo scorers when bounds cannot beat current minimum had inconsistent gains across run orders. | **Rejected** |
-| **Worker counter cacheline separation** | Separating worker atomic counters onto individual cachelines produced inconsistent Chromium results. | **Rejected** |
-| **Claiming 4 jobs at a time in pool** | Median filename latency regressed on both Linux and Chromium. | **Rejected** |
+Use the [profiling guide](profiling/README.md) to capture and interpret profiles.
+Local captures in `profiles/` retain folded stacks, summaries, and available SVG flamegraphs.

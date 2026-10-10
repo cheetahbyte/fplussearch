@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Consolidate benchmark reports into `benchmarks/README.md`, organize raw results under `benchmarks/results/`, and update runner output defaults and documentation links.
+
 - Replace ancestor walks with query-local subtree bitmaps for global negation-only searches. Reversed-order socket benchmarks improve this query class by 29-31% on Linux and 48-49% on Chromium; ordinary filename latency remains inconclusive. See `benchmarks/README.md#ancestor-exclusion-bitmaps` for details.
 - Add classified engine workloads and a three-round latency tool with p50/p90, CPU, peak RSS, and ordered-result captures.
 

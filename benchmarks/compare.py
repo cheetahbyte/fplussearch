@@ -185,7 +185,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("datasets", type=Path)
     parser.add_argument("--fsearch", type=Path, default=Path("../fsearch"))
-    parser.add_argument("--out", type=Path, default=Path("benchmarks/results.json"))
+    parser.add_argument("--out", type=Path, default=Path("benchmarks/results/results.json"))
     parser.add_argument("--baseline", type=Path)
     parser.add_argument("--rounds", type=int, default=1)
     parser.add_argument("--isolate", action=argparse.BooleanOptionalAction, default=True)
@@ -243,6 +243,7 @@ def main():
                 output["datasets"][name] = merged
             else:
                 output["datasets"][name] = run(root, harness, directory, args.baseline, args.rounds)
+            args.out.parent.mkdir(parents=True, exist_ok=True)
             args.out.write_text(json.dumps(output, indent=2) + "\n")
             print(name, json.dumps(output["datasets"][name]["results"], indent=2), flush=True)
 

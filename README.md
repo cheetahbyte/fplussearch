@@ -144,8 +144,8 @@ They don't measure cold-cache or whole-disk performance. The baseline uses pre-c
 Benchmark the normal fplussearch executable against either source tree:
 
 ```sh
-python3 benchmarks/benchmark.py ~/fplussearch-bench/linux --binary build/fplussearch --out benchmarks/linux.json
-python3 benchmarks/benchmark.py ~/fplussearch-bench/chromium --binary build/fplussearch --out benchmarks/chromium.json
+python3 benchmarks/benchmark.py ~/fplussearch-bench/linux --binary build/fplussearch --out benchmarks/results/linux.json
+python3 benchmarks/benchmark.py ~/fplussearch-bench/chromium --binary build/fplussearch --out benchmarks/results/chromium.json
 ```
 
 See the [benchmark harness guide](benchmarks/README.md) for setup and comparison details.
