@@ -110,6 +110,7 @@ These changes do not establish a consistent whole-process memory or content-buil
 | Experiment | Reason not retained |
 | --- | --- |
 | Filter-plan precomputation; single-token NEON masks | Gains disappear or reverse with run order |
+| Query-precomputed three-position substring NEON filter | Fewer verifications without consistent end-to-end latency gains |
 | Lazy prefix ranking; progressive prefix expansion | Inconsistent latency or worse Chromium tails |
 | Fewer filename jobs or threads; caller-only search | No repeatable gain or larger-dataset regressions |
 | Typo-bound pruning; worker counter/publishing changes | Inconsistent gains |
@@ -123,6 +124,10 @@ These changes do not establish a consistent whole-process memory or content-buil
 | Reader-local path strings | Fewer allocations but slower warmed medians |
 | ThinLTO default | Small Chromium benefit; Linux inconclusive, no flag change retained |
 | Linux-trained PGO with ThinLTO | Full-disk query classes and p90 regress |
+
+The [three-position substring experiment](results/find-ci-experiment/README.md) records counters, the prototype, and repeated latency comparisons.
+The third probe rejects 71% of eligible NEON survivors on Linux and 82% on Chromium, but overall socket medians increase 0.5-1.0%.
+Short filenames never enter NEON. Long-filename gains are small or reverse with invocation order; the production matcher remains unchanged.
 
 The retained [content experiment data](results/content-experiments.json) includes measurements, replay sources, and the freshness fixture.
 A content K-way merge was investigated but not implemented: sorting was not the measured bottleneck.
