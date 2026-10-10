@@ -102,7 +102,12 @@ struct Section {
   uint32_t blocks() const { return uint32_t(block_off.n - 1); }
   uint32_t first_entry() const { return block_first[0]; }
   uint32_t end_entry() const { return block_first[block_first.n - 1]; }
-  uint32_t count(uint32_t name) const;
+  inline uint32_t count(uint32_t name) const {
+    const uint8_t c = counts[name];
+    if (c != 255) [[likely]] return c;
+    return count_slow(name);
+  }
+  uint32_t count_slow(uint32_t name) const;
 };
 
 // Read-only index, usually a memory-mapped cache file. Directories are entries

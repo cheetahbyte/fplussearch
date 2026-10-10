@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Inline ordinary filename counts and keep overflow lookup in a cold helper, preserving the index format and fallback behavior. Reversed-order socket benchmarks improve Chromium filename medians by 2.2-3.6%; Linux socket results are inconclusive. See `benchmarks/README.md#inline-name-counts`.
+
 - Consolidate benchmark reports into `benchmarks/README.md`, organize raw results under `benchmarks/results/`, and update runner output defaults and documentation links.
 
 - Replace ancestor walks with query-local subtree bitmaps for global negation-only searches. Reversed-order socket benchmarks improve this query class by 29-31% on Linux and 48-49% on Chromium; ordinary filename latency remains inconclusive. See `benchmarks/README.md#ancestor-exclusion-bitmaps` for details.

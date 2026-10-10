@@ -844,11 +844,10 @@ size_t unpack_hex(const char* p, char* out, size_t& len) {
   return 1 + packed;
 }
 
-uint32_t Section::count(uint32_t name) const {
-  const uint8_t c = counts[name];
-  if (c != 255) return c;
+[[gnu::noinline, gnu::cold]]
+uint32_t Section::count_slow(uint32_t name) const {
   const Overflow* o = find_key(overflow, name);
-  return o ? uint32_t(o->value) : c;
+  return o ? uint32_t(o->value) : 255;
 }
 
 uint64_t Index::big_size(uint32_t e) const {
