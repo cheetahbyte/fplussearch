@@ -521,6 +521,8 @@ struct Scan {
       for (const Token* t : neg) n = n || t->fits(m);
       if (!n) return false;
     }
+    if (!q.exts.empty() && !ext_ok(name, q.exts)) return false;
+    if (q.name_re && !q.name_re->matches(name)) return false;
     h = NameHit{};
     h.flags = name_flags(name);
     int32_t total = 0;
@@ -535,8 +537,7 @@ struct Scan {
     h.score = int16_t(std::clamp(total, -32768, 32767));
     for (const Token* t : neg)
       if (t->fits(m) && token_matches(name, *t)) h.flags |= kNameNeg;
-    const bool ok = (pos.empty() || h.bits) && !(h.flags & kNameNeg) && (q.exts.empty() || ext_ok(name, q.exts)) &&
-                    (!q.name_re || q.name_re->matches(name));
+    const bool ok = (pos.empty() || h.bits) && !(h.flags & kNameNeg);
     if (ok) h.flags |= kNameOk;
     return ok || h.bits || (h.flags & kNameNeg);
   }
@@ -634,7 +635,7 @@ struct Scan {
           const char* end = (i + 1 < un ? bs + s.name_off[k + 1] : be) - 1;
           nm = {p, size_t(end - p)};
         }
-        visit(e, c, nm, masks[i]);
+        visit(e, c, nm, masks[next]);
         if (!s.name_first) e += c;
         ++i;
         hits &= hits - 1;
