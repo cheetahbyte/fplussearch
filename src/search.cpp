@@ -265,12 +265,33 @@ bool takes_typos(const Token& t) { return t.mode == Mode::Fuzzy && t.text.size()
 
 size_t find_ci(std::string_view name, std::string_view q) {
   if (q.size() > name.size()) return std::string_view::npos;
+  if (q.empty()) return 0;
+  if (q.size() == 1) return find_folded(name, 0, uint8_t(q[0]));
   const size_t last = name.size() - q.size();
-  for (size_t i = 0;; ++i) {
-    i = find_folded(name, i, uint8_t(q[0]));
-    if (i == std::string_view::npos || i > last) return std::string_view::npos;
-    if (fold_eq(name.data() + i, q)) return i;
+  const uint8_t first = uint8_t(q.front()), end = uint8_t(q.back());
+  const uint8_t fm = first >= 'a' && first <= 'z' ? 0x20 : 0;
+  const uint8_t lm = end >= 'a' && end <= 'z' ? 0x20 : 0;
+  size_t i = 0;
+#if defined(__ARM_NEON)
+  const uint8x16_t F = vdupq_n_u8(first), L = vdupq_n_u8(end);
+  const uint8x16_t FM = vdupq_n_u8(fm), LM = vdupq_n_u8(lm);
+  for (; i <= last && last - i >= 15; i += 16) {
+    const auto* p = reinterpret_cast<const uint8_t*>(name.data() + i);
+    const uint8x16_t matches = vandq_u8(
+        vceqq_u8(vorrq_u8(vld1q_u8(p), FM), F),
+        vceqq_u8(vorrq_u8(vld1q_u8(p + q.size() - 1), LM), L));
+    uint64_t bits = lane_bits(matches);
+    while (bits) {
+      const size_t offset = size_t(std::countr_zero(bits) >> 2);
+      if (q.size() == 2 || fold_eq(name.data() + i + offset, q)) return i + offset;
+      bits &= ~(uint64_t(0xf) << (offset * 4));
+    }
   }
+#endif
+  for (; i <= last; ++i)
+    if ((uint8_t(name[i]) | fm) == first && (uint8_t(name[i + q.size() - 1]) | lm) == end &&
+        (q.size() == 2 || fold_eq(name.data() + i, q))) return i;
+  return std::string_view::npos;
 }
 
 bool token_matches(std::string_view name, const Token& t) {
@@ -287,31 +308,28 @@ bool ext_ok(std::string_view name, const std::vector<std::string>& exts) {
   return false;
 }
 
-// Bit i set if any token fits masks[i], for up to 64 masks. The compare
-// loop is branch-free so it vectorizes; packing to bits is a second pass.
-uint64_t fit_bits(const uint64_t* in, uint32_t n, const Token* const* toks, size_t nt) {
-  alignas(64) uint64_t tail[64] = {};
-  const uint64_t* masks = in;
-  if (n < 64) {  // the section's last block: don't read past its masks
-    std::memcpy(tail, in, n * sizeof(uint64_t));
-    masks = tail;
-  }
-  alignas(64) uint8_t ok[64] = {};
+uint64_t fit_bits(const uint64_t* planes, uint32_t n, const Token* const* toks, size_t nt) {
+  uint64_t hits = 0;
   for (size_t t = 0; t < nt; ++t) {
-    const uint64_t tm = toks[t]->mask, keep = ~toks[t]->loose, start = toks[t]->start;
-    if (keep == ~uint64_t(0) && start == 0) {
-      for (uint32_t i = 0; i < 64; ++i) ok[i] |= uint8_t((tm & ~masks[i]) == 0);
-    } else {
-      for (uint32_t i = 0; i < 64; ++i) {
-        const uint64_t m = masks[i], miss = tm & ~m;
-        const uint64_t typo = ((miss & keep) | (miss & (miss - 1))) | uint64_t((m & start) == 0);
-        ok[i] |= uint8_t((miss == 0) | (typo == 0));
-      }
+    const Token& token = *toks[t];
+    uint64_t zero = ~uint64_t(0), one = 0, required = ~uint64_t(0);
+    uint64_t mask = token.mask;
+    while (mask) {
+      const unsigned bit = std::countr_zero(mask);
+      const uint64_t present = planes[bit];
+      one = (one & present) | (zero & ~present);
+      zero &= present;
+      if (!(token.loose & (uint64_t(1) << bit))) required &= present;
+      mask &= mask - 1;
     }
+    uint64_t starts = 0, start = token.start;
+    while (start) {
+      starts |= planes[std::countr_zero(start)];
+      start &= start - 1;
+    }
+    hits |= zero | (one & required & starts);
   }
-  uint64_t bits = 0;
-  for (uint32_t i = 0; i < 64; ++i) bits |= uint64_t(ok[i]) << i;
-  return n == 64 ? bits : bits & ((uint64_t(1) << n) - 1);
+  return n == 64 ? hits : hits & ((uint64_t(1) << n) - 1);
 }
 
 // ---------------------------------------------------------------- ranking
@@ -544,7 +562,7 @@ struct Scan {
   // matter, calls visit(first entry, count, hit).
   // Visits names in blocks [a, b) of section `s` whose mask a token fits:
   // visit(first entry, count, name, mask). Masks are tested 64 names at a
-  // time without branches, so most blocks are skipped after a few vector ops.
+  // time using bit-plane intersections.
   template <typename Visit>
   void candidates(int si, uint32_t a, uint32_t b, Visit&& visit) const {
     const Section& s = ix.sections[size_t(si)];
@@ -559,7 +577,7 @@ struct Scan {
       const uint32_t u0 = blk * kBlock, un = std::min(kBlock, s.names() - u0);
       const uint64_t* masks = s.mask.p + u0;
       uint64_t hits = all ? (un == 64 ? ~uint64_t(0) : (uint64_t(1) << un) - 1) : 0;
-      if (!all) hits = fit_bits(masks, un, toks.data(), nt);
+      if (!all) hits = fit_bits((*s.mask_planes)[blk].data(), un, toks.data(), nt);
       if (!hits) continue;
       const char* bs = s.bytes.p + s.block_off[blk];
       const char* be = s.bytes.p + s.block_off[blk + 1];

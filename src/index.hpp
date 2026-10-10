@@ -96,6 +96,7 @@ struct Section {
   Span<uint8_t> counts;        // per name, entries with that name; 255 = see overflow
   Span<Overflow> overflow;     // name -> count, sorted
   Span<uint64_t> mask;         // per name, name_mask
+  std::shared_ptr<const std::vector<std::array<uint64_t, kBlock>>> mask_planes;
 
   uint32_t names() const { return uint32_t(name_off.n); }
   uint32_t blocks() const { return uint32_t(block_off.n - 1); }

@@ -3,3 +3,6 @@ build/
 .swiftpm/
 .DS_Store
 benchmarks/**/*.json
+__pycache__/
+*.folded
+benchmarks/profiles/

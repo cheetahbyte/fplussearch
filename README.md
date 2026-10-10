@@ -151,8 +151,10 @@ python3 benchmarks/benchmark.py ~/fplussearch-bench/chromium --binary build/fplu
 See the [benchmark harness guide](benchmarks/README.md) for setup and comparison details.
 Raw JSON stays local and untracked. Run-to-run variation doesn't establish a consistent speed improvement from the substring change.
 
-Index pages are clean file-backed memory, so macOS can drop them under
-memory pressure and read them back from the cache files.
+Mapped index pages are clean file-backed memory, so macOS can drop them under
+memory pressure and read them back from the cache files. Filename candidate
+bit planes are shared, heap-backed data rebuilt when an index loads.
+See [bit-plane benchmark results](benchmarks/bit-sliced-mask-results.md) for measurements and memory trade-offs.
 
 ## How it works
 
@@ -161,7 +163,8 @@ memory pressure and read them back from the cache files.
 - Each name is stored once: 6.35 million entries share 1.44 million names.
   Sorted name sets map matches directly to contiguous entry ranges.
   Long lowercase hex names use a separate packed section, skipped by non-hex queries.
-- NEON filters candidate names in batches before parallel substring and typo scoring.
+- Immutable bit planes filter candidate names in batches before parallel substring and typo scoring.
+- Substring scoring checks candidate endpoints together, using bounded SIMD loads on ARM NEON. See [substring benchmark results](benchmarks/substring-pair-results.md).
   Compact parent, size, and type fields support batched metadata filters.
 - Results rank by match quality, location, recency, and visibility.
   Score bounds skip candidates that can't reach the top results while still counting matches.

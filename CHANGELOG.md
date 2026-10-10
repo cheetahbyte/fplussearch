@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Accelerate bounded case-insensitive substring matching with first/last-byte filtering and ARM NEON checks. Repeated Chromium filename benchmarks improve median latency by 3-6% and p90 by about 15%; Linux results are inconclusive. See `benchmarks/substring-pair-results.md` for generic workloads and limitations.
+
+- Filter filename candidates with immutable index-owned bit planes, preserving raw masks and matching semantics. Repeated three-round socket benchmarks reduce filename medians by 6-11% on Linux and 17-18% on Chromium; see `benchmarks/bit-sliced-mask-results.md`.
+
 - Reduce ranked filename-search jobs from 24 to eight per worker; three-round Linux measurements show lower median latency, with Chromium validation pending.
 
 - Release temporary filename-index buffers at their last use instead of retaining vector capacity.

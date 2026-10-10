@@ -125,6 +125,18 @@ bool attach(Index& ix, Fields&& f) {
   if (!ok) return false;
   r.bytes = f.bytes;
   r.backing = std::move(f.backing);
+  for (auto& s : r.sections) {
+    auto planes = std::make_shared<std::vector<std::array<uint64_t, kBlock>>>(
+        (size_t(s.names()) + kBlock - 1) / kBlock);
+    for (uint32_t i = 0; i < s.names(); ++i) {
+      uint64_t mask = s.mask[i];
+      while (mask) {
+        (*planes)[i / kBlock][std::countr_zero(mask)] |= uint64_t(1) << (i % kBlock);
+        mask &= mask - 1;
+      }
+    }
+    s.mask_planes = std::move(planes);
+  }
   ix = std::move(r);
   return true;
 }
