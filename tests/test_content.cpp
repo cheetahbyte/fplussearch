@@ -26,6 +26,19 @@ static bool has(const GrepResult& r, const std::string& p) {
   return false;
 }
 
+static std::vector<std::string> paths(const GrepResult& r) {
+  std::vector<std::string> out;
+  for (const auto& f : r.files) out.push_back(f.path);
+  return out;
+}
+
+static void set_mtime(const std::string& p, time_t seconds) {
+  struct timespec times[2]{};
+  times[0].tv_nsec = UTIME_OMIT;
+  times[1].tv_sec = seconds;
+  assert(utimensat(AT_FDCWD, p.c_str(), times, 0) == 0);
+}
+
 int main() {
   std::mt19937 random(713);
   for (size_t length : {size_t(0), size_t(4), size_t(7), size_t(100), size_t(10000)}) {
@@ -99,5 +112,45 @@ int main() {
   write_file(hit, "the indexed match was removed\n");
   const auto removed = ix->grep(q);
   assert(removed.read > 0 && !has(removed, hit));
+
+  // Candidate ordering stays exact when matching files are spread across
+  // several live segments. This also covers dead docs and ties in rank and
+  // mtime, where path order is the final tiebreaker.
+  const std::string ordered_home = home + "/ordering-home";
+  const std::string cache2 = ordered_home + "/cache";
+  const std::string segment_a = ordered_home + "/a", segment_b = ordered_home + "/b",
+                    segment_c = ordered_home + "/c", segment_d = ordered_home + "/d";
+  assert(mkdir(ordered_home.c_str(), 0755) == 0);
+  assert(mkdir(segment_a.c_str(), 0755) == 0);
+  assert(mkdir(segment_b.c_str(), 0755) == 0);
+  assert(mkdir(segment_c.c_str(), 0755) == 0);
+  assert(mkdir(segment_d.c_str(), 0755) == 0);
+  const std::string alpha = segment_a + "/alpha.txt", beta = segment_b + "/beta.txt",
+                    gamma = segment_c + "/gamma.txt", old = segment_d + "/old.txt",
+                    log = segment_d + "/zeta.log";
+  for (const auto& p : {alpha, beta, gamma, old, log}) write_file(p, "ordering needle\n");
+  set_mtime(alpha, 100);
+  set_mtime(beta, 200);
+  set_mtime(gamma, 200);
+  set_mtime(old, 50);
+  set_mtime(log, 300);
+
+  auto ordered = std::make_unique<ContentIndex>(cache2, ordered_home, 2);
+  ordered->open();
+  ordered->update_paths({segment_a});
+  ordered->update_paths({segment_b});
+  ordered->update_paths({segment_c});
+  ordered->update_paths({segment_d});
+  GrepOptions ordering_query;
+  ordering_query.pattern = "ordering needle";
+  ordering_query.budget_ms = 0;
+  ordering_query.limit = 20;
+  assert(paths(ordered->grep(ordering_query)) == std::vector<std::string>({beta, gamma, alpha, old, log}));
+
+  // A subsequent direct update kills the old document in its segment; the
+  // remaining live docs keep the same cross-segment order.
+  write_file(old, "gone\n");
+  ordered->update_paths({segment_d});
+  assert(paths(ordered->grep(ordering_query)) == std::vector<std::string>({beta, gamma, alpha, log}));
   std::cout << "Content Bloom regression checks passed\n";
 }

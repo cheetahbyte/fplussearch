@@ -723,6 +723,7 @@ struct ContentIndex::Segment {
   Span<char> paths;
   Span<uint64_t> size;
   Span<int8_t> rank;
+  std::vector<uint32_t> path_order;  // document -> position in by_path
   std::shared_ptr<const std::vector<BloomView>> blooms;
   std::shared_ptr<const void> bloom_backing;
 
@@ -856,6 +857,12 @@ std::shared_ptr<ContentIndex::Segment> map_segment(const std::string& dir, uint6
                   seg->size.n == seg->ndocs && seg->mtime.n == seg->ndocs && seg->by_path.n == seg->ndocs &&
                   seg->rank.n == seg->ndocs;
   if (!ok) return nullptr;
+  seg->path_order.resize(seg->ndocs);
+  for (uint32_t i = 0; i < seg->ndocs; ++i) {
+    const uint32_t d = seg->by_path[i];
+    if (d >= seg->ndocs) return nullptr;
+    seg->path_order[d] = i;
+  }
   const int bf = open(seg_file(dir, id, "blm").c_str(), O_RDONLY | O_CLOEXEC);
   if (bf >= 0) {
     struct stat bst{};
@@ -1721,11 +1728,11 @@ GrepResult ContentIndex::grep(const GrepOptions& o) const {
   while (scope.size() > 1 && scope.back() == '/') scope.pop_back();
   const std::string lo = scope.empty() ? std::string() : scope + "/";
   struct Cand {
-    std::string_view path;
-    int8_t rank;
-    uint32_t mtime;
+    uint64_t priority;  // signed rank, then modification time, descending
+    uint32_t order;     // lexicographic path position within the segment
   };
-  // Candidates per segment, in parallel on the reader pool.
+  // Sort each segment using integers; its immutable path permutation supplies
+  // the exact lexicographic tie-break without repeatedly comparing strings.
   std::vector<std::vector<Cand>> per(st->segs.size());
   std::lock_guard rl(read_m_);
   readers_->run(st->segs.size(), [&](size_t si) {
@@ -1737,34 +1744,48 @@ GrepResult ContentIndex::grep(const GrepOptions& o) const {
       if (!lo.empty() && !p.starts_with(lo)) return;
       if (o.keep && !o.keep(p)) return;
       if (!bloom_probes.empty() && !s.may_contain(d, bloom_probes)) return;
-      per[si].push_back({p, s.rank[d], s.mtime[d]});
+      const uint64_t priority = (uint64_t(int(s.rank[d]) + 128) << 32) | s.mtime[d];
+      per[si].push_back({priority, s.path_order[d]});
     };
     if (auto ids = eval(s, plan)) {
       for (uint32_t d : *ids) take(d);
-      return;
-    }
-    if (lo.empty()) {
+    } else if (lo.empty()) {
       for (uint32_t d = 0; d < s.ndocs; ++d) take(d);
-      return;
+    } else {
+      // Every doc in scope: the path-sorted permutation finds the range.
+      const uint32_t* bp = s.by_path.p;
+      const uint32_t* it = std::lower_bound(bp, bp + s.ndocs, lo, [&](uint32_t d, const std::string& x) { return s.path(d) < x; });
+      for (; it != bp + s.ndocs && s.path(*it).starts_with(lo); ++it) take(*it);
     }
-    // Every doc in scope: the path-sorted permutation finds the range.
-    const uint32_t* bp = s.by_path.p;
-    const uint32_t* it = std::lower_bound(bp, bp + s.ndocs, lo, [&](uint32_t d, const std::string& x) { return s.path(d) < x; });
-    for (; it != bp + s.ndocs && s.path(*it).starts_with(lo); ++it) take(*it);
+    std::sort(per[si].begin(), per[si].end(), [](const Cand& a, const Cand& b) {
+      return a.priority != b.priority ? a.priority > b.priority : a.order < b.order;
+    });
   });
   size_t candidate_count = 0;
   for (const auto& p : per) candidate_count += p.size();
-  std::vector<Cand> cands;
+  std::vector<std::string_view> cands;
   cands.reserve(candidate_count);
-  for (auto& p : per) {
-    cands.insert(cands.end(), p.begin(), p.end());
-    std::vector<Cand>().swap(p);
+  struct Cursor { size_t segment, index; };
+  auto path = [&](Cursor c) {
+    const Segment& s = *st->segs[c.segment].seg;
+    return s.path(s.by_path[per[c.segment][c.index].order]);
+  };
+  auto worse = [&](Cursor a, Cursor b) {
+    const uint64_t pa = per[a.segment][a.index].priority, pb = per[b.segment][b.index].priority;
+    return pa != pb ? pa < pb : path(a) > path(b);
+  };
+  // String comparisons are needed only when merging different segments.
+  std::priority_queue<Cursor, std::vector<Cursor>, decltype(worse)> heap(worse);
+  for (size_t si = 0; si < per.size(); ++si)
+    if (!per[si].empty()) heap.push({si, 0});
+  while (!heap.empty()) {
+    Cursor c = heap.top();
+    heap.pop();
+    cands.push_back(path(c));
+    if (++c.index < per[c.segment].size()) heap.push(c);
   }
-  // Your files before dot-folders and logs, then the most recently changed.
-  std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) {
-    return a.rank != b.rank ? a.rank > b.rank : a.mtime != b.mtime ? a.mtime > b.mtime : a.path < b.path;
-  });
-  return verify(*readers_, m, o, cands.size(), [&](size_t i) { return cands[i].path; });
+  for (auto& p : per) std::vector<Cand>().swap(p);
+  return verify(*readers_, m, o, cands.size(), [&](size_t i) { return cands[i]; });
 }
 
 GrepResult ContentIndex::grep_files(const GrepOptions& o, const std::vector<std::string>& paths) const {
