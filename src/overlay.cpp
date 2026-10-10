@@ -272,6 +272,7 @@ bool Live::cache_changed() const {
 
 void Live::run(std::shared_ptr<const Index> ix) {
   if (ix) stat(opt_.cache_file.c_str(), &cache_stat_);
+  bool bloom_refresh_scheduled = false;
   while (!stop_) {
     if (!ix || ix->event_id == 0 || ix->event_id > current_event_id()) {
       if (owner_) {
@@ -295,7 +296,11 @@ void Live::run(std::shared_ptr<const Index> ix) {
     }
     // The content index may be behind the cached index (a first run, or
     // files changed while nothing was running): catch it up.
-    if (owner_ && content_ && content_->docs() == 0) content_sync(ix);
+    if (owner_ && content_) {
+      const bool legacy = !bloom_refresh_scheduled && content_->needs_bloom_refresh();
+      if (content_->docs() == 0 || legacy) content_sync(ix);
+      bloom_refresh_scheduled = bloom_refresh_scheduled || legacy;
+    }
     Watcher watcher(opt_.root, ix->event_id, ignore_, kLatency);
     switch (follow(watcher)) {
       case Next::Stop:

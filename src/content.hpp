@@ -77,6 +77,8 @@ class ContentIndex {
 
   size_t docs() const;
   size_t bytes() const;
+  // Live text documents in the configured area lack Bloom sidecars.
+  bool needs_bloom_refresh() const;
 
   struct Segment;
   struct State;

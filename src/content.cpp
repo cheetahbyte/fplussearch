@@ -309,12 +309,18 @@ void trigrams(const char* buf, size_t n, std::vector<uint32_t>& scratch, BigVec<
 }
 
 // A pattern's trigrams with the follow bits every doc must have.
-std::vector<std::pair<uint32_t, uint8_t>> trigrams_small(std::string_view s) {
+// PCRE2 UTF caseless matching also equates K/S with Kelvin sign/long S.
+bool unicode_case_byte(uint8_t c) { return fold(c) == 'k' || fold(c) == 's'; }
+
+std::vector<std::pair<uint32_t, uint8_t>> trigrams_small(std::string_view s, bool unicode_caseless = false) {
   std::vector<std::pair<uint32_t, uint8_t>> t;
   for (size_t i = 0; i + 3 <= s.size(); ++i) {
+    if (unicode_caseless && (unicode_case_byte(uint8_t(s[i])) || unicode_case_byte(uint8_t(s[i + 1])) ||
+                            unicode_case_byte(uint8_t(s[i + 2])))) continue;
     const uint32_t tri =
         uint32_t(fold(uint8_t(s[i]))) << 16 | uint32_t(fold(uint8_t(s[i + 1]))) << 8 | fold(uint8_t(s[i + 2]));
-    t.push_back({tri, i + 3 < s.size() ? follow_bit(fold(uint8_t(s[i + 3]))) : uint8_t(0)});
+    const bool follow = i + 3 < s.size() && (!unicode_caseless || !unicode_case_byte(uint8_t(s[i + 3])));
+    t.push_back({tri, follow ? follow_bit(fold(uint8_t(s[i + 3]))) : uint8_t(0)});
   }
   std::sort(t.begin(), t.end());
   std::vector<std::pair<uint32_t, uint8_t>> out;
@@ -329,7 +335,7 @@ std::vector<std::pair<uint32_t, uint8_t>> trigrams_small(std::string_view s) {
 
 // Which documents could possibly match: a tree of trigram tests.
 struct TQ {
-  enum Kind : uint8_t { All, Tri, And, Or } kind = All;
+  enum Kind : uint8_t { All, Tri, And, Or, Gram5, Gram7 } kind = All;
   uint32_t tri = 0;
   uint8_t need = 0;  // follow bits a doc must have for `tri`
   std::vector<TQ> kids;
@@ -347,12 +353,73 @@ TQ tq_and(TQ a, TQ b) {
   return r;
 }
 
-TQ literal_plan(std::string_view s) {
+TQ literal_plan(std::string_view s, bool unicode_caseless = false, bool blooms = false) {
   TQ q;
   if (s.size() < 3) return q;
   q.kind = TQ::And;
-  for (auto [t, need] : trigrams_small(s)) q.kids.push_back({TQ::Tri, t, need, {}});
+  for (auto [t, need] : trigrams_small(s, unicode_caseless)) q.kids.push_back({TQ::Tri, t, need, {}});
+  if (blooms) {
+    for (size_t n : {size_t(5), size_t(7)}) {
+      for (size_t i = 0; i + n <= s.size(); ++i) {
+        const auto gram = s.substr(i, n);
+        if (unicode_caseless && std::any_of(gram.begin(), gram.end(), [](char c) { return unicode_case_byte(uint8_t(c)); })) continue;
+        q.kids.push_back({n == 5 ? TQ::Gram5 : TQ::Gram7, gram_hash(gram.data(), n), 0, {}});
+      }
+    }
+  }
+  return q.kids.empty() ? TQ{} : q;
+}
+
+TQ regex_literal_plan(std::string_view s, bool caseless) {
+  if (!caseless) return literal_plan(s, false, true);
+  // Enumerate the UTF equivalents of ASCII K/S instead of losing their
+  // useful byte constraints. Bound expansion for long runs of these letters.
+  std::vector<std::string> literals{std::string()};
+  for (char c : s) {
+    const bool extra = unicode_case_byte(uint8_t(c));
+    if (extra && literals.size() >= 16) return literal_plan(s, true, true);
+    const size_t n = literals.size();
+    for (size_t i = 0; i < n; ++i) {
+      if (extra) literals.push_back(literals[i] + (fold(uint8_t(c)) == 'k' ? "\xE2\x84\xAA" : "\xC5\xBF"));
+      literals[i] += c;
+    }
+  }
+  if (literals.size() == 1) return literal_plan(literals[0], false, true);
+  TQ q;
+  q.kind = TQ::Or;
+  for (const auto& literal : literals) q.kids.push_back(literal_plan(literal, false, true));
   return q;
+}
+
+TQ bloom_only_plan(const TQ& q) {
+  if (q.kind == TQ::Gram5 || q.kind == TQ::Gram7) return q;
+  if (q.kind != TQ::And && q.kind != TQ::Or) return {};
+  TQ out;
+  out.kind = q.kind;
+  for (const TQ& child : q.kids) {
+    TQ b = bloom_only_plan(child);
+    if (b.kind == TQ::All) {
+      if (q.kind == TQ::Or) return {};
+    } else {
+      out.kids.push_back(std::move(b));
+    }
+  }
+  if (out.kids.empty()) return {};
+  if (out.kids.size() == 1) return std::move(out.kids[0]);
+  return out;
+}
+
+// Preserve alternatives: an unconstrained branch passes, and optional
+// fragments never impose a requirement on every match.
+bool bloom_plan_matches(const BloomView& b, const TQ& q) {
+  switch (q.kind) {
+    case TQ::Gram5: return bloom_has(b.short_bits, q.tri);
+    case TQ::Gram7: return bloom_has(b.long_bits, q.tri);
+    case TQ::And: return std::all_of(q.kids.begin(), q.kids.end(), [&](const TQ& child) { return bloom_plan_matches(b, child); });
+    case TQ::Or: return std::any_of(q.kids.begin(), q.kids.end(), [&](const TQ& child) { return bloom_plan_matches(b, child); });
+    case TQ::All: case TQ::Tri: return true;
+  }
+  return true;
 }
 
 // What a regex fragment says about matching text: a small set of exact
@@ -363,14 +430,14 @@ struct Info {
 };
 constexpr size_t kMaxExact = 16;
 
-TQ exact_query(const std::optional<std::vector<std::string>>& set) {
+TQ exact_query(const std::optional<std::vector<std::string>>& set, bool unicode_caseless = false) {
   TQ q;
   if (!set || set->empty()) return q;
   for (const auto& s : *set)
     if (s.size() < 3) return q;
-  if (set->size() == 1) return literal_plan((*set)[0]);
+  if (set->size() == 1) return regex_literal_plan((*set)[0], unicode_caseless);
   q.kind = TQ::Or;
-  for (const auto& s : *set) q.kids.push_back(literal_plan(s));
+  for (const auto& s : *set) q.kids.push_back(regex_literal_plan(s, unicode_caseless));
   return q;
 }
 
@@ -382,7 +449,7 @@ void dedup(std::vector<std::string>& v) {
   v.erase(std::unique(v.begin(), v.end()), v.end());
 }
 
-Info concat(Info cur, Info n) {
+Info concat(Info cur, Info n, bool unicode_caseless = false) {
   if (cur.exact && n.exact && cur.exact->size() * n.exact->size() <= kMaxExact) {
     std::vector<std::string> set;
     for (const auto& a : *cur.exact)
@@ -390,12 +457,12 @@ Info concat(Info cur, Info n) {
     dedup(set);
     return {std::move(set), tq_and(std::move(cur.q), std::move(n.q))};
   }
-  TQ q = tq_and(tq_and(std::move(cur.q), exact_query(cur.exact)), std::move(n.q));
+  TQ q = tq_and(tq_and(std::move(cur.q), exact_query(cur.exact, unicode_caseless)), std::move(n.q));
   if (n.exact && n.exact->size() <= kMaxExact) return {std::move(n.exact), std::move(q)};
-  return {std::nullopt, tq_and(std::move(q), exact_query(n.exact))};
+  return {std::nullopt, tq_and(std::move(q), exact_query(n.exact, unicode_caseless))};
 }
 
-Info alternate(std::vector<Info> parts) {
+Info alternate(std::vector<Info> parts, bool unicode_caseless = false) {
   bool all_exact = true;
   for (const Info& p : parts) all_exact = all_exact && p.exact.has_value();
   if (all_exact) {
@@ -407,7 +474,7 @@ Info alternate(std::vector<Info> parts) {
   TQ ors;
   ors.kind = TQ::Or;
   for (Info& p : parts) {
-    TQ q = tq_and(std::move(p.q), exact_query(p.exact));
+    TQ q = tq_and(std::move(p.q), exact_query(p.exact, unicode_caseless));
     if (q.kind == TQ::All) return info_all();
     ors.kids.push_back(std::move(q));
   }
@@ -418,11 +485,13 @@ Info alternate(std::vector<Info> parts) {
 // becomes "no requirement", which only costs extra candidate reads.
 class RegexPlanner {
  public:
-  explicit RegexPlanner(std::string_view p) : p_(p) {}
+  explicit RegexPlanner(std::string_view p, bool caseless = false) : p_(p), caseless_(caseless) {
+    safe_ = std::all_of(p.begin(), p.end(), [](char c) { return uint8_t(c) < 0x80; }) && p.find("(*") == std::string_view::npos;
+  }
   TQ plan() {
     Info i = alternation();
-    if (i_ != p_.size()) return TQ{};  // unbalanced: give up safely
-    return tq_and(std::move(i.q), exact_query(i.exact));
+    if (!safe_ || i_ != p_.size()) return TQ{};  // unsupported or unbalanced: give up safely
+    return tq_and(std::move(i.q), exact_query(i.exact, caseless_));
   }
 
  private:
@@ -432,12 +501,12 @@ class RegexPlanner {
       ++i_;
       parts.push_back(sequence());
     }
-    return parts.size() == 1 ? std::move(parts[0]) : alternate(std::move(parts));
+    return parts.size() == 1 ? std::move(parts[0]) : alternate(std::move(parts), caseless_);
   }
 
   Info sequence() {
     Info cur = info_exact({""});
-    while (i_ < p_.size() && p_[i_] != '|' && p_[i_] != ')') cur = concat(std::move(cur), repeat());
+    while (i_ < p_.size() && p_[i_] != '|' && p_[i_] != ')') cur = concat(std::move(cur), repeat(), caseless_);
     return cur;
   }
 
@@ -462,7 +531,7 @@ class RegexPlanner {
       }
       if (i_ < p_.size() && (p_[i_] == '?' || p_[i_] == '+')) ++i_;  // lazy / possessive
       if (lo == 0) a = info_all();
-      else a = {std::nullopt, tq_and(std::move(a.q), exact_query(a.exact))};  // at least one copy appears
+      else a = {std::nullopt, tq_and(std::move(a.q), exact_query(a.exact, caseless_))};  // at least one copy appears
     }
   }
 
@@ -477,6 +546,9 @@ class RegexPlanner {
         bool look = false;
         if (i_ < p_.size() && p_[i_] == '?') {
           ++i_;
+          // Inline modes, assertions and extensions need richer PCRE
+          // semantics. Let fresh-file verification handle them directly.
+          if (i_ >= p_.size() || p_[i_] != ':') safe_ = false;
           if (i_ < p_.size() && (p_[i_] == '=' || p_[i_] == '!')) look = true, ++i_;
           else if (i_ + 1 < p_.size() && p_[i_] == '<' && (p_[i_ + 1] == '=' || p_[i_ + 1] == '!')) look = true, i_ += 2;
           else if (i_ < p_.size() && (p_[i_] == '<' || p_[i_] == 'P' || p_[i_] == '\'')) {
@@ -533,7 +605,10 @@ class RegexPlanner {
         }
         return info_all();
       default:
-        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) return info_all();
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
+          if (std::string_view("dDsSwWhHvVRXC").find(c) == std::string_view::npos) safe_ = false;
+          return info_all();
+        }
         return info_exact({std::string(1, char(fold(uint8_t(c))))});  // escaped punctuation
     }
   }
@@ -582,6 +657,8 @@ class RegexPlanner {
 
   std::string_view p_;
   size_t i_ = 0;
+  bool caseless_ = false;
+  bool safe_ = true;
 };
 
 // ---------------------------------------------------------------- matching
@@ -1132,6 +1209,20 @@ size_t ContentIndex::bytes() const {
   return n;
 }
 
+bool ContentIndex::needs_bloom_refresh() const {
+  const auto current = state();
+  const std::string prefix = home_ == "/" ? home_ : home_ + "/";
+  for (const SegView& v : current->segs) {
+    if (v.seg->blooms || v.live == 0) continue;
+    const Segment& s = *v.seg;
+    const auto begin = s.by_path.p, end = begin + s.ndocs;
+    auto it = std::lower_bound(begin, end, prefix, [&](uint32_t d, const std::string& p) { return s.path(d) < p; });
+    for (; it != end && s.path(*it).starts_with(prefix); ++it)
+      if (!v.is_dead(*it) && s.rank[*it] != kNotText) return true;
+  }
+  return false;
+}
+
 void ContentIndex::add_docs(std::vector<DocIn>& docs, bool background) {
   if (docs.empty()) return;
   const unsigned threads = std::min(12u, std::max(1u, std::thread::hardware_concurrency()));
@@ -1565,7 +1656,7 @@ std::atomic<uint64_t> g_diag_ns{0}, g_diag_lists{0}, g_diag_bytes{0}, g_diag_rem
 // candidates are few: a superset only costs a read, decoding costs more.
 std::optional<std::vector<uint32_t>> eval(const ContentIndex::Segment& s, const TQ& q) {
   switch (q.kind) {
-    case TQ::All:
+    case TQ::All: case TQ::Gram5: case TQ::Gram7:
       return std::nullopt;
     case TQ::Tri: {
       const size_t k = s.find(q.tri);
@@ -1716,7 +1807,8 @@ GrepResult ContentIndex::grep(const GrepOptions& o) const {
   GrepResult r;
   Matcher m;
   if (!make_matcher(o, m, r.error)) return r;
-  const TQ plan = o.regex ? RegexPlanner(o.pattern).plan() : literal_plan(o.pattern);
+  const TQ plan = o.regex ? RegexPlanner(o.pattern, m.caseless).plan() : literal_plan(o.pattern);
+  const TQ regex_bloom = o.regex ? bloom_only_plan(plan) : TQ{};
   std::vector<std::pair<uint32_t, uint8_t>> bloom_probes;
   if (!o.regex) {
     for (size_t n : {size_t(5), size_t(7)})
@@ -1744,6 +1836,7 @@ GrepResult ContentIndex::grep(const GrepOptions& o) const {
       if (!lo.empty() && !p.starts_with(lo)) return;
       if (o.keep && !o.keep(p)) return;
       if (!bloom_probes.empty() && !s.may_contain(d, bloom_probes)) return;
+      if (regex_bloom.kind != TQ::All && s.blooms && !bloom_plan_matches((*s.blooms)[d], regex_bloom)) return;
       const uint64_t priority = (uint64_t(int(s.rank[d]) + 128) << 32) | s.mtime[d];
       per[si].push_back({priority, s.path_order[d]});
     };

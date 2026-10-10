@@ -39,7 +39,91 @@ static void set_mtime(const std::string& p, time_t seconds) {
   assert(utimensat(AT_FDCWD, p.c_str(), times, 0) == 0);
 }
 
+static void assert_regex_bloom_sound() {
+  struct Case {
+    std::string pattern;
+    bool caseless;
+    std::string text;
+  };
+  const std::vector<Case> cases = {
+      {"12345-678", false, "prefix 12345-678 suffix"},
+      {"12345-678", true, "prefix 12345-678 suffix"},
+      {"foo12345|bar12345", false, "bar12345"},
+      {"foo?12345", false, "fo12345"},
+      {"foo|bar12345", true, "foo"},
+      {"12345(?:foo)?67890", true, "1234567890"},
+      {"(foo12345)*bar67890", true, "bar67890"},
+      {"ab{2,3}12345", false, "abb12345"},
+      {"^abc12345$", false, "abc12345"},
+      {"[a-z]12345", false, "z12345"},
+      {R"(\d12345)", false, "912345"},
+      {"(?x)foo 12345", false, "foo12345"},
+      {R"((abc)\1-12345)", false, "abcabc-12345"},
+      {R"(\X12345)", false, "a12345"},
+      {R"(\cA12345)", false, "\x01" "12345"},
+      {R"(\x{41}12345)", false, "A12345"},
+      {"(?i)ABC12345", false, "abc12345"},
+      {"(?!wrong)foo12345", true, "foo12345"},
+      {"k12345", true, "\xE2\x84\xAA" "12345"},  // Kelvin sign
+      {"s12345", true, "\xC5\xBF" "12345"},      // long s
+      {"abcds", true, "abcd\xC5\xBF"},
+      {"\xC3\xA9?12345", false, "12345"},
+  };
+  for (const auto& c : cases) {
+    std::string error;
+    auto re = Regex::compile(c.pattern, c.caseless, true, error);
+    assert(re && error.empty());
+    assert(re->matches(c.text));
+    const TQ plan = RegexPlanner(c.pattern, c.caseless).plan();
+    const TQ bloom = bloom_only_plan(plan);
+    Bloom bits;
+    make_bloom(c.text, bits);
+    const BloomView view{bits.short_bits, bits.long_bits, 0, 0};
+    assert(bloom_plan_matches(view, bloom));
+  }
+  std::mt19937 random(917);
+  auto literal = [&] {
+    std::string s(8, 'a');
+    for (char& c : s) c = "abcdefks019"[random() % 11];
+    return s;
+  };
+  for (size_t trial = 0; trial < 2000; ++trial) {
+    const std::string a = literal(), b = literal(), c = literal();
+    std::string pattern, text;
+    switch (trial % 6) {
+      case 0: pattern = a + ".*" + b; text = a + c + b; break;
+      case 1: pattern = "(?:" + a + "|" + c + ")" + b; text = (random() % 2 ? a : c) + b; break;
+      case 2: pattern = "(?:" + a + ")?" + b; text = (random() % 2 ? a : "") + b; break;
+      case 3: pattern = a + "[abc]" + b; text = a + "abc"[random() % 3] + b; break;
+      case 4:
+        pattern = "(?:" + a + "){0,2}" + b;
+        for (unsigned i = 0, n = random() % 3; i < n; ++i) text += a;
+        text += b;
+        break;
+      case 5: pattern = "(?:" + a + ")+" + b; text = a + a + b; break;
+    }
+    const bool caseless = random() % 2;
+    if (caseless) {
+      std::string utf;
+      for (char ch : text) {
+        if (ch == 'k') utf += "\xE2\x84\xAA";
+        else if (ch == 's') utf += "\xC5\xBF";
+        else utf += ch;
+      }
+      text = std::move(utf);
+    }
+    std::string error;
+    auto re = Regex::compile(pattern, caseless, true, error);
+    assert(re && re->matches(text));
+    Bloom bits;
+    make_bloom(text, bits);
+    assert(bloom_plan_matches({bits.short_bits, bits.long_bits, 0, 0},
+                              bloom_only_plan(RegexPlanner(pattern, caseless).plan())));
+  }
+}
+
 int main() {
+  assert_regex_bloom_sound();
   std::mt19937 random(713);
   for (size_t length : {size_t(0), size_t(4), size_t(7), size_t(100), size_t(10000)}) {
     std::string text(length, ' ');
@@ -60,6 +144,9 @@ int main() {
   const std::string hit = home + "/hit.txt", miss = home + "/miss.txt";
   write_file(hit, "prefix qz7tesy suffix\n");
   write_file(miss, "qz7t z7te 7tes tesy\n");
+  const std::string kelvin = home + "/kelvin.txt", long_s = home + "/long-s.txt";
+  write_file(kelvin, "\xE2\x84\xAA" "12345\n");
+  write_file(long_s, "\xC5\xBF" "12345\n");
 
   auto ix = std::make_unique<ContentIndex>(cache, home, 2);
   ix->open();
@@ -74,6 +161,13 @@ int main() {
   q.pattern = "qz7tes.";
   q.regex = true;
   if (!has(ix->grep(q), hit)) { std::cerr << "regex failed\n"; return EXIT_FAILURE; }
+  q.pattern = "qz7tesy";
+  const auto regex_bloom = ix->grep(q);
+  assert(regex_bloom.read == 1 && has(regex_bloom, hit));
+  q.pattern = "k12345";
+  assert(has(ix->grep(q), kelvin));
+  q.pattern = "s12345";
+  assert(has(ix->grep(q), long_s));
 
   // Same-size edits with unchanged mtime must refresh the Bloom filter.
   q.regex = false;
@@ -106,7 +200,17 @@ int main() {
   ix.reset();
   ix = std::make_unique<ContentIndex>(cache, home, 2);
   ix->open();
+  q.regex = true;
+  assert(ix->needs_bloom_refresh());
+  {
+    ContentIndex replay(cache, home + "/unrelated-area", 1);
+    replay.open();
+    assert(!replay.needs_bloom_refresh());
+  }
+  assert(has(ix->grep(q), hit));  // No sidecar: regex filtering must fail open.
+  q.regex = false;
   ix->update_paths({}, {home});
+  assert(!ix->needs_bloom_refresh());
   if (!has(ix->grep(q), hit)) { std::cerr << "legacy failed\n"; return EXIT_FAILURE; }
   // A Bloom-positive file is still read fresh before any match is returned.
   write_file(hit, "the indexed match was removed\n");

@@ -4,6 +4,7 @@ Mirrors fsearch's examples/rig.rs output format so demo/abba.py works seamlessly
 
 usage: python3 demo/rig.py <binary> <corpus.json> <out.json> [kinds]
 kinds: comma-separated subset of name,typing,grep (default all)
+The corpus can set root and cache_home to replay an isolated dataset cache.
 """
 
 import hashlib
@@ -24,12 +25,12 @@ def fnv64(data: bytes, h: int = 0xcbf29ce484222325) -> int:
 
 
 class DaemonClient:
-    def __init__(self, binary_path: str, root_path: str = "/"):
+    def __init__(self, binary_path: str, root_path: str = "/", cache_home=None):
         self.tmp = tempfile.TemporaryDirectory(prefix="fpr-", dir="/tmp")
         self.home = Path(self.tmp.name)
         self.is_fsearch = "fsearch" in Path(binary_path).name and "fplussearch" not in Path(binary_path).name
 
-        real_home = Path(os.environ.get("HOME", ""))
+        real_home = Path(cache_home) if cache_home else Path(os.environ.get("HOME", ""))
         if self.is_fsearch:
             self.app_dir = self.home / "Library/Application Support/FSearch"
             self.app_dir.mkdir(parents=True, exist_ok=True)
@@ -93,13 +94,16 @@ class DaemonClient:
                 res = self.call({"op": "status"})
                 if res.get("ok"):
                     if not self.is_fsearch:
-                        if res.get("ready") and not res.get("busy"):
+                        if res.get("ready") and not res.get("busy") and not res.get("content_pending"):
                             break
                     else:
                         break
             except RuntimeError:
                 pass
             time.sleep(0.05)
+        else:
+            self.close()
+            raise RuntimeError("Daemon did not finish indexing within 60 seconds")
 
     def call(self, req: dict):
         self.f.write(json.dumps(req) + "\n")
@@ -194,7 +198,7 @@ def main():
             }
         res[key]["ms"].append(ms)
 
-    client = DaemonClient(binary)
+    client = DaemonClient(binary, root_path=corpus.get("root", "/"), cache_home=corpus.get("cache_home"))
     try:
         # 1. Name queries
         names = corpus.get("names", [])
