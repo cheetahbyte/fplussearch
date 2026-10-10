@@ -25,7 +25,6 @@
 #include "search.hpp"
 #include "server.hpp"
 #include "symindex.hpp"
-#include "tui.hpp"
 
 using namespace fplussearch;
 
@@ -44,7 +43,7 @@ void usage() {
                "usage: fplussearch [options] [query]\n"
                "       fplussearch serve | stdio | status | install [--login] | uninstall\n"
                "\n"
-               "  no query       interactive search; Enter prints the selected path\n"
+               "  no query       show this help and exit\n"
                "  query          print matching paths and exit (asks the daemon when it runs,\n"
                "                 otherwise answers from the cache and starts the daemon)\n"
                "  serve          run the daemon in the foreground: keeps the index current and\n"
@@ -373,6 +372,7 @@ int main(int argc, char** argv) {
       command = a;
     else words.push_back(a);
   }
+  if (command.empty() && words.empty() && !do_bench) return usage(), 0;
   if (limit == 0) limit = SIZE_MAX;
   if (char* real = realpath(root.c_str(), nullptr)) {
     root = real;
@@ -402,10 +402,9 @@ int main(int argc, char** argv) {
     return stdio(fd);
   }
 
-  const bool query_mode = !words.empty() || !isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO);
   std::string text;
   for (const auto& w : words) text += (text.empty() ? "" : " ") + w;
-  if (query_mode && !do_bench && !reindex && use_daemon) {
+  if (!do_bench && !reindex && use_daemon) {
     // The daemon follows changes, so its answer is current.
     if (int fd = daemon_connection(root, cache, false, {}); fd >= 0) {
       int status = 1;
@@ -435,48 +434,40 @@ int main(int argc, char** argv) {
     return bench(*ix, load_syms(), engine, words);
   }
 
-  if (query_mode) {
-    if (!ix && use_daemon) {
-      // No index yet: the daemon builds it and answers once it has.
-      if (int fd = daemon_connection(root, cache, true, std::chrono::seconds(10)); fd >= 0) {
-        std::fprintf(stderr, "indexing the disk (once, about 20 s)...\n");
-        for (;;) {
-          int status = 1;
-          if (print_daemon_results(fd, text, limit, status)) return status;
-          std::this_thread::sleep_for(std::chrono::milliseconds(250));
-        }
+  if (!ix && use_daemon) {
+    // No index yet: the daemon builds it and answers once it has.
+    if (int fd = daemon_connection(root, cache, true, std::chrono::seconds(10)); fd >= 0) {
+      std::fprintf(stderr, "indexing the disk (once, about 20 s)...\n");
+      for (;;) {
+        int status = 1;
+        if (print_daemon_results(fd, text, limit, status)) return status;
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
       }
     }
-    if (!ix) ix = build(root, cache, scan_threads);
-    const SymbolIndex* sx = load_syms();
-    auto t0 = Clock::now();
-    Query q = parse_query(text, home());
-    Results r = run_query(*ix, sx, engine, q, q.limit ? q.limit : limit);
-    double ms = ms_since(t0);
-    if (!q.syms.empty() && !sx) std::fprintf(stderr, "no symbol index; run with --reindex\n");
-    for (uint32_t e : r.top) {
-      if (q.syms.empty()) {
-        std::printf("%s\n", ix->path(e).c_str());
-        continue;
-      }
-      const std::string path = ix->path(sx->occ[e]);
-      const std::string_view name = sx->symbol(e);
-      const SymbolLocation loc = locate_symbol(path, name);
-      std::printf("%s:%u: %s %.*s\n", path.c_str(), loc.line, loc.found ? kind_name(loc.kind) : "?",
-                  int(name.size()), name.data());
-    }
-    if (!q.error.empty()) std::fprintf(stderr, "%s\n", q.error.c_str());
-    std::fprintf(stderr, "%llu matches in %.3f ms (%zu entries)\n", (unsigned long long)r.total, ms,
-                 ix->count());
-    std::fflush(stdout);
-    // Later queries get current answers from the daemon.
-    if (use_daemon && rescan) daemon_connection(root, cache, true, {});
-    return r.total ? 0 : 1;
   }
-
-  TuiOptions opt{root, cache, scan_threads, rescan};
-  std::string chosen = run_tui(ix, engine, opt);
-  if (chosen.empty()) return 1;
-  std::printf("%s\n", chosen.c_str());
-  return 0;
+  if (!ix) ix = build(root, cache, scan_threads);
+  const SymbolIndex* sx = load_syms();
+  auto t0 = Clock::now();
+  Query q = parse_query(text, home());
+  Results r = run_query(*ix, sx, engine, q, q.limit ? q.limit : limit);
+  double ms = ms_since(t0);
+  if (!q.syms.empty() && !sx) std::fprintf(stderr, "no symbol index; run with --reindex\n");
+  for (uint32_t e : r.top) {
+    if (q.syms.empty()) {
+      std::printf("%s\n", ix->path(e).c_str());
+      continue;
+    }
+    const std::string path = ix->path(sx->occ[e]);
+    const std::string_view name = sx->symbol(e);
+    const SymbolLocation loc = locate_symbol(path, name);
+    std::printf("%s:%u: %s %.*s\n", path.c_str(), loc.line, loc.found ? kind_name(loc.kind) : "?",
+                int(name.size()), name.data());
+  }
+  if (!q.error.empty()) std::fprintf(stderr, "%s\n", q.error.c_str());
+  std::fprintf(stderr, "%llu matches in %.3f ms (%zu entries)\n", (unsigned long long)r.total, ms,
+               ix->count());
+  std::fflush(stdout);
+  // Later queries get current answers from the daemon.
+  if (use_daemon && rescan) daemon_connection(root, cache, true, {});
+  return r.total ? 0 : 1;
 }

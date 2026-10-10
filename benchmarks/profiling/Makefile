@@ -5,7 +5,7 @@ CXX ?= c++
 FLAGS := -std=c++20 -O3 -g -mcpu=native -Wall -Wextra -Wpedantic -I$(ROOT)/src -isystem $(PCRE)/include
 SOURCES := $(wildcard $(ROOT)/src/*.cpp)
 OBJECTS := $(patsubst $(ROOT)/src/%.cpp,$(OUT)/%.o,$(SOURCES))
-LIBOBJECTS := $(filter-out $(OUT)/main.o $(OUT)/tui.o,$(OBJECTS))
+LIBOBJECTS := $(filter-out $(OUT)/main.o,$(OBJECTS))
 HEADERS := $(wildcard $(ROOT)/src/*.hpp)
 LINK := -pthread -framework CoreServices $(PCRE)/lib/libpcre2-8.a
 

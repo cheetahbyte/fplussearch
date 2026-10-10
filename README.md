@@ -1,7 +1,7 @@
 # fplussearch
 
 Whole-disk filename and code symbol search for macOS, written in C++.
-Search files, folders, functions, and types with every keystroke.
+Search files, folders, functions, and types through the CLI or daemon.
 
 Inspired by [Noah's Rust file search engine](https://github.com/noahdunnagan/fsearch).
 
@@ -79,7 +79,7 @@ revisions until releases define compatibility guarantees.
 ## Usage
 
 ```sh
-build/fplussearch                          # interactive; Enter prints the selected path
+build/fplussearch                          # show help and exit
 build/fplussearch 'size:>1gb type:video'   # print matches and exit
 build/fplussearch --bench                  # timing table
 ```
@@ -91,14 +91,11 @@ build/fplussearch --bench                  # timing table
 | `--no-rescan` | Use the cached index without refreshing it |
 | `--threads N` | Search threads (default: all cores) |
 | `--scan-threads N` | Indexing threads (default: 8) |
-| `-n N` | Results to print in query mode (default 50, `0` = all) |
-
-Interactive keys: arrows or Ctrl-P/Ctrl-N to select, Enter to print the path
-and exit, Ctrl-U to clear, Ctrl-W to delete a word, Esc or Ctrl-C to quit.
+| `-n N` | Results to print (default 50, `0` = all) |
 
 The first run caches the index in `~/Library/Caches/fplussearch/`: about 25 s
 for 6 million entries, plus 45 s for symbols in 2 million source files.
-Later runs map the cache in milliseconds. Interactive mode uses FSEvents to
+Later runs map the cache in milliseconds. The daemon uses FSEvents to
 refresh changed folders and source files in the background (about 2 s for the
 whole disk), then checks every 30 s. It fully rescans only if FSEvents loses track of changes.
 
@@ -123,7 +120,7 @@ Prefix a word with `'` to disable typo matching, or `!` to exclude a literal sub
 | `ext:mp4,mov` | Names ending in any of the extensions |
 | `sym:parse` | Functions, types, macros and modules whose name contains `parse`, defined in source files; other parts of the query filter the files (`sym:render ext:tsx`) |
 
-In symbol results, Enter prints `path:line`.
+Symbol queries print `path:line: kind name`.
 
 ## Performance
 
@@ -181,9 +178,9 @@ See [bit-plane benchmark results](benchmarks/README.md#bit-sliced-candidate-mask
 - Case-insensitive matching covers ASCII only. Names are matched byte for
   byte, so an accented character typed in a different Unicode normalization
   form than the file name will not match.
-- Query mode (`fplussearch QUERY`) and `--bench` use the cache as it is;
-  only the interactive mode refreshes it. While the interactive mode is open,
-  changes can take up to 30 s to appear.
+- CLI queries use the daemon when available, otherwise the cached index.
+  The daemon refreshes the index; changes can take up to 30 s to appear.
+  `--bench` uses the cache without refreshing it.
 - Filename results are ranked by match quality, location, recency, and visibility.
   Substring matching doesn't support scattered-letter abbreviations.
 - Symbol extraction is heuristic, not a parser: unusual code can be missed or

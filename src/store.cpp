@@ -86,7 +86,7 @@ bool save_fields(const std::string& file, const char (&magic)[8], const std::arr
     off = align64(off + fields[i].size);
   }
   // A unique temporary per writer: concurrent builds (a CLI --reindex while
-  // the TUI refreshes) must never write into a file another one publishes.
+  // the daemon refreshes) must never write into a file another one publishes.
   std::string tmp = file + ".XXXXXX";
   const int fd = mkstemp(tmp.data());
   if (fd < 0) return false;

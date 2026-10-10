@@ -8,7 +8,7 @@ LDFLAGS += $(PCRE2)/lib/libpcre2-8.a
 SRC := $(wildcard src/*.cpp)
 OBJ := $(SRC:src/%.cpp=build/%.o)
 
-LIBOBJ := $(filter-out build/main.o build/tui.o,$(OBJ))
+LIBOBJ := $(filter-out build/main.o,$(OBJ))
 
 build/fplussearch: $(OBJ)
 	$(CXX) $(CXXFLAGS) $(OBJ) -o $@ $(LDFLAGS)
