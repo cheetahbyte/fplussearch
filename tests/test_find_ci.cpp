@@ -1,13 +1,16 @@
-#include "../src/search.cpp"
+#include "search/detail/bit_filter.hpp"
+#include "search/detail/substring.hpp"
 
 #include <cstdlib>
 #include <array>
+#include <cstring>
 #include <iostream>
 #include <random>
 #include <sys/mman.h>
 #include <unistd.h>
 
 using namespace fplussearch;
+using namespace fplussearch::detail;
 
 uint64_t reference_fit_bits(const uint64_t* planes, uint32_t n, const Token* const* toks, size_t nt) {
   uint64_t hits = 0;

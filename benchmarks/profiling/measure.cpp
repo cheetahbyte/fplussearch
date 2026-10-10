@@ -1,5 +1,5 @@
-#include "index.hpp"
-#include "search.hpp"
+#include "index/index.hpp"
+#include "search/engine.hpp"
 
 #include <algorithm>
 #include <chrono>

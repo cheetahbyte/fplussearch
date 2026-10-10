@@ -1,4 +1,5 @@
-#include "search.hpp"
+#include "search/matching.hpp"
+#include "search/query.hpp"
 
 #include <cstdlib>
 #include <chrono>

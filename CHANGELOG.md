@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Organize C++ sources by subsystem and split scanning, matching, content indexing, live updates, protocol handling, and storage into focused files. Use `-Isrc` and subsystem-qualified headers for C++ embedding, including `live/live.hpp`. Update normal and profiling builds for nested sources and compiler-generated dependencies; retain existing matching checks without including `.cpp` files.
+
 - Remove the interactive terminal interface. Running without a query now shows help and exits. Keep the CLI, daemon, C++ library, and Swift client.
 
 - Replace long-name scalar substring tails with bounded overlapping NEON blocks. Reversed-order Chromium socket medians improve 7-8% and p90 about 19%; Linux socket medians remain unchanged. Add randomized NEON/scalar differential checks and guard-page coverage to `make test-search`. See `benchmarks/profiling/find_ci.md` for measurements and workload-specific regressions.

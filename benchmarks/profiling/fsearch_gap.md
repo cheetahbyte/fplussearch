@@ -9,6 +9,8 @@ The four-reader variant exists only in a temporary diagnostic build.
 
 ## Versions and method
 
+Source paths and line numbers below refer to these revisions, before the source-directory reorganization.
+
 - fplussearch: `95a48cf`, including the overlapping NEON substring tail.
 - fsearch: `d753915`, with a clean checkout.
 - Workloads: the same Linux and Chromium queries from `fsearch-updated-forward.json`.

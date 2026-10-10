@@ -1,4 +1,7 @@
-#include "../src/content.cpp"
+#include "content/bloom.hpp"
+#include "content/content_index.hpp"
+#include "content/regex_planner.hpp"
+#include "search/regex.hpp"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -14,6 +17,7 @@
 #include <string>
 
 using namespace fplussearch;
+using namespace fplussearch::content_detail;
 
 static void write_file(const std::string& p, const std::string& s) {
   std::ofstream f(p, std::ios::binary);

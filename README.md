@@ -46,8 +46,28 @@ make lib        # produces build/libfplussearch.a for C++ embedding
 make test-search # runs name-matching regression checks
 ```
 
-The library's entry point is `src/live.hpp`. Link with CoreServices and
-PCRE2; the Swift package doesn't require linking the C++ library.
+The library's entry point is `live/live.hpp`, with `src` on your include path (`-Isrc`).
+Link with CoreServices and PCRE2; the Swift package doesn't require linking the C++ library.
+
+### Source layout
+
+| Directory | Responsibility |
+| --- | --- |
+| `src/cli/` | Command-line output, daemon commands, installation, and benchmarks |
+| `src/daemon/` | Socket transport, request handling, and server loop |
+| `src/index/` | File metadata, directory scanning, index assembly, and cache loading |
+| `src/search/` | Query parsing, filename matching, ranking, and the search engine |
+| `src/content/` | Content segments, Bloom filters, query planning, and file verification |
+| `src/live/` | FSEvents watching, live state, overlays, and refresh scheduling |
+| `src/symbols/` | Source lexing, symbol extraction, and the symbol index |
+| `src/storage/` | Mapped arrays, string interning, and binary field storage |
+| `src/support/` | JSON and the worker pool |
+| `Sources/FPlusSearch/` | Swift daemon client |
+
+`src/main.cpp` parses arguments and dispatches CLI commands.
+Headers use paths relative to `src`, such as `search/engine.hpp` and `content/content_index.hpp`.
+The Makefiles discover nested source files and track object dependencies with compiler-generated `.d` files.
+Tests use headers rather than including implementation files; the scalar matching target compiles without ARM NEON.
 
 ## Use from Swift
 
