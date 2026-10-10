@@ -457,6 +457,7 @@ struct Scan {
   std::array<uint8_t, 256> file_ok{};  // per kind byte: 0 reject, 1 accept, 2 check exact size
   bool no_entry_filters = false;       // every entry of a matching name matches
   BigVec<DirHit>* dir_hits = nullptr;
+  const BigVec<uint64_t>* neg_dirs = nullptr;
   std::vector<uint32_t> scoped_entries;
   std::unordered_map<uint32_t, DirHit> scoped_hits;
   decltype(Overlay::dead) dead = nullptr;
@@ -537,7 +538,10 @@ struct Scan {
   int32_t entry_score(uint32_t e, const NameHit& h) const {
     int32_t score = h.score;
     const uint32_t p = ix.parent(e);
-    if (need_dirs) {
+    if (need_dirs && neg_dirs) {
+      const uint32_t pre = ix.dir_pre[p];
+      if (((*neg_dirs)[pre >> 6] >> (pre & 63)) & 1) return kNoMatch;
+    } else if (need_dirs) {
       uint8_t bits = 0;
       std::array<int16_t, 4> best{};
       for (uint32_t a = p;; a = ix.parent(a)) {
@@ -564,7 +568,7 @@ struct Scan {
   // visit(first entry, count, name, mask). Masks are tested 64 names at a
   // time using bit-plane intersections.
   template <typename Visit>
-  void candidates(int si, uint32_t a, uint32_t b, Visit&& visit) const {
+  void candidates(int si, uint32_t a, uint32_t b, Visit&& visit, bool token_only = false) const {
     const Section& s = ix.sections[size_t(si)];
     char buf[256 + 32];
     std::array<const Token*, 16> toks{};
@@ -572,7 +576,7 @@ struct Scan {
     for (const Token* t : pos) toks[nt++] = t;
     for (const Token* t : neg)
       if (nt < toks.size()) toks[nt++] = t;
-    const bool all = pos.empty();
+    const bool all = pos.empty() && (!token_only || nt != neg.size());
     for (uint32_t blk = a; blk < b; ++blk) {
       const uint32_t u0 = blk * kBlock, un = std::min(kBlock, s.names() - u0);
       const uint64_t* masks = s.mask.p + u0;
@@ -1087,16 +1091,38 @@ std::vector<Job> make_jobs(const Index& ix, const Scan& sc, size_t target) {
   return jobs;
 }
 
-// Fills `hits` with every directory's own token matches, for entries whose
-// tokens are matched by a folder above them.
-void fill_dir_hits(const Index& ix, Scan& sc, Pool& pool, BigVec<DirHit>& hits) {
-  hits.assign(ix.dirs, DirHit{});
+// Positive tokens need scores; negation-only queries need just the union
+// of matching directories' subtrees in preorder.
+void fill_dir_hits(const Index& ix, Scan& sc, Pool& pool, BigVec<DirHit>& hits, BigVec<uint64_t>& neg_dirs) {
   std::vector<std::pair<int, std::pair<uint32_t, uint32_t>>> jobs;
   const size_t per = std::max<size_t>(1, (ix.sections[0].block_off[ix.sections[0].blocks()] +
                                           ix.sections[1].block_off[ix.sections[1].blocks()]) /
                                              (size_t(pool.size()) * 8));
   for (int s = 0; s < 2; ++s)
     split_blocks(ix.sections[size_t(s)], per, [&](uint32_t b, uint32_t e) { jobs.push_back({s, {b, e}}); });
+  if (sc.pos.empty()) {
+    neg_dirs.assign((size_t(ix.dirs) + 63) / 64, 0);
+    pool.run(jobs.size(), [&](size_t j) {
+      sc.candidates(jobs[j].first, jobs[j].second.first, jobs[j].second.second,
+                    [&](uint32_t e0, uint32_t c, std::string_view name, uint64_t mask) {
+                      NameHit h;
+                      if (!sc.name_hit(name, mask, h) || !(h.flags & kNameNeg)) return;
+                      for (uint32_t e = e0; e < e0 + c; ++e) {
+                        const uint32_t first = ix.dir_pre[e], end = ix.dir_end[e];
+                        const uint32_t last = (end - 1) >> 6;
+                        for (uint32_t word = first >> 6; word <= last; ++word) {
+                          const unsigned lo = word == (first >> 6) ? first & 63 : 0;
+                          const unsigned hi = word == last ? ((end - 1) & 63) + 1 : 64;
+                          const uint64_t bits = (~uint64_t(0) << lo) & (~uint64_t(0) >> (64 - hi));
+                          __atomic_fetch_or(&neg_dirs[word], bits, __ATOMIC_RELAXED);
+                        }
+                      }
+                    }, true);
+    });
+    sc.neg_dirs = &neg_dirs;
+    return;
+  }
+  hits.assign(ix.dirs, DirHit{});
   pool.run(jobs.size(), [&](size_t j) {
     sc.names(jobs[j].first, jobs[j].second.first, jobs[j].second.second,
              [&](uint32_t e0, uint32_t c, const NameHit& h) {
@@ -1117,9 +1143,10 @@ void Engine::each_match(const Index& ix, const Query& q, bool files_only, const 
   if (sc.scope_missing) return;
   if (files_only) sc.dirs_ok = false;
   BigVec<DirHit> dir_hits;
+  BigVec<uint64_t> neg_dirs;
   const bool selective = prepare_scope(ix, sc);
   if (sc.need_dirs && !selective) {
-    fill_dir_hits(ix, sc, pool_, dir_hits);
+    fill_dir_hits(ix, sc, pool_, dir_hits, neg_dirs);
     sc.dir_hits = &dir_hits;
   }
   const std::vector<Job> jobs = make_jobs(ix, sc, size_t(pool_.size()) * 24);
@@ -1154,9 +1181,10 @@ Results Engine::search(const Index& ix, const Query& q, size_t limit, const Over
   const bool scope_new = sc.scope_missing && overlay && !overlay->extras.empty();
   if (sc.scope_missing && !scope_new) return r;
   BigVec<DirHit> dir_hits;
+  BigVec<uint64_t> neg_dirs;
   const bool selective = prepare_scope(ix, sc);
   if (sc.need_dirs && !selective) {
-    fill_dir_hits(ix, sc, pool_, dir_hits);
+    fill_dir_hits(ix, sc, pool_, dir_hits, neg_dirs);
     sc.dir_hits = &dir_hits;
   }
   const std::vector<Job> jobs = scope_new ? std::vector<Job>() : make_jobs(ix, sc, size_t(pool_.size()) * 8);

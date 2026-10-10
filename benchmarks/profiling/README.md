@@ -12,6 +12,9 @@ make -f benchmarks/profiling/Makefile -j8
 
 This creates `build/profiling/fplussearch`, `build/profiling/replay`, and their debug-symbol bundles. Compilation keeps `-O3 -mcpu=native` and adds `-g`. It does not replace `build/fplussearch`.
 
+It also creates `build/profiling/measure` for unprofiled engine latency measurements.
+The [performance experiment report](../performance-experiments.md#reproduce-engine-comparisons) describes classified workloads, response captures, and reversed-order comparisons.
+
 ## Profile the daemon
 
 Replace `WORKLOAD.json` with an existing standalone benchmark result containing its replayable workload:

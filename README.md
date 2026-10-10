@@ -154,7 +154,7 @@ Raw JSON stays local and untracked. Run-to-run variation doesn't establish a con
 Mapped index pages are clean file-backed memory, so macOS can drop them under
 memory pressure and read them back from the cache files. Filename candidate
 bit planes are shared, heap-backed data rebuilt when an index loads.
-See [bit-plane benchmark results](benchmarks/bit-sliced-mask-results.md) for measurements and memory trade-offs.
+See [bit-plane benchmark results](benchmarks/README.md#bit-sliced-candidate-masks) for measurements and memory trade-offs.
 
 ## How it works
 
@@ -164,7 +164,7 @@ See [bit-plane benchmark results](benchmarks/bit-sliced-mask-results.md) for mea
   Sorted name sets map matches directly to contiguous entry ranges.
   Long lowercase hex names use a separate packed section, skipped by non-hex queries.
 - Immutable bit planes filter candidate names in batches before parallel substring and typo scoring.
-- Substring scoring checks candidate endpoints together, using bounded SIMD loads on ARM NEON. See [substring benchmark results](benchmarks/substring-pair-results.md).
+- Substring scoring checks candidate endpoints together, using bounded SIMD loads on ARM NEON. See [substring benchmark results](benchmarks/README.md#bounded-substring-matching).
   Compact parent, size, and type fields support batched metadata filters.
 - Results rank by match quality, location, recency, and visibility.
   Score bounds skip candidates that can't reach the top results while still counting matches.

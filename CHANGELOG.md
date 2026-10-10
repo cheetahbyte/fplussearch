@@ -2,9 +2,12 @@
 
 ## Unreleased
 
-- Accelerate bounded case-insensitive substring matching with first/last-byte filtering and ARM NEON checks. Repeated Chromium filename benchmarks improve median latency by 3-6% and p90 by about 15%; Linux results are inconclusive. See `benchmarks/substring-pair-results.md` for generic workloads and limitations.
+- Replace ancestor walks with query-local subtree bitmaps for global negation-only searches. Reversed-order socket benchmarks improve this query class by 29-31% on Linux and 48-49% on Chromium; ordinary filename latency remains inconclusive. See `benchmarks/README.md#ancestor-exclusion-bitmaps` for details.
+- Add classified engine workloads and a three-round latency tool with p50/p90, CPU, peak RSS, and ordered-result captures.
 
-- Filter filename candidates with immutable index-owned bit planes, preserving raw masks and matching semantics. Repeated three-round socket benchmarks reduce filename medians by 6-11% on Linux and 17-18% on Chromium; see `benchmarks/bit-sliced-mask-results.md`.
+- Accelerate bounded case-insensitive substring matching with first/last-byte filtering and ARM NEON checks. Repeated Chromium filename benchmarks improve median latency by 3-6% and p90 by about 15%; Linux results are inconclusive. See `benchmarks/README.md#bounded-substring-matching` for generic workloads and limitations.
+
+- Filter filename candidates with immutable index-owned bit planes, preserving raw masks and matching semantics. Repeated three-round socket benchmarks reduce filename medians by 6-11% on Linux and 17-18% on Chromium; see `benchmarks/README.md#bit-sliced-candidate-masks`.
 
 - Reduce ranked filename-search jobs from 24 to eight per worker; three-round Linux measurements show lower median latency, with Chromium validation pending.
 

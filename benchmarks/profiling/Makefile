@@ -9,7 +9,7 @@ LIBOBJECTS := $(filter-out $(OUT)/main.o $(OUT)/tui.o,$(OBJECTS))
 HEADERS := $(wildcard $(ROOT)/src/*.hpp)
 LINK := -pthread -framework CoreServices $(PCRE)/lib/libpcre2-8.a
 
-all: $(OUT)/replay $(OUT)/fplussearch
+all: $(OUT)/replay $(OUT)/fplussearch $(OUT)/measure
 
 $(OUT):
 	mkdir -p $@
@@ -20,6 +20,9 @@ $(OUT)/%.o: $(ROOT)/src/%.cpp $(HEADERS) | $(OUT)
 $(OUT)/replay: $(ROOT)/benchmarks/profiling/replay.cpp $(LIBOBJECTS) $(HEADERS)
 	$(CXX) $(FLAGS) $(ROOT)/benchmarks/profiling/replay.cpp $(LIBOBJECTS) -o $@ $(LINK)
 	dsymutil $@
+
+$(OUT)/measure: $(ROOT)/benchmarks/profiling/measure.cpp $(LIBOBJECTS) $(HEADERS)
+	$(CXX) $(FLAGS) $(ROOT)/benchmarks/profiling/measure.cpp $(LIBOBJECTS) -o $@ $(LINK)
 
 $(OUT)/fplussearch: $(OBJECTS)
 	$(CXX) $(FLAGS) $^ -o $@ $(LINK)
