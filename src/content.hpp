@@ -54,7 +54,7 @@ struct GrepResult {
 class ContentIndex {
  public:
   // dir: where segments live. home: the indexed area (a real path).
-  ContentIndex(std::string dir, std::string home, unsigned readers = 12);
+  ContentIndex(std::string dir, std::string home, unsigned readers = 4);
   ~ContentIndex();
   ContentIndex(const ContentIndex&) = delete;
   ContentIndex& operator=(const ContentIndex&) = delete;

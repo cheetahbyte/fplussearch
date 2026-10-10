@@ -1,12 +1,37 @@
 #include "../src/search.cpp"
 
 #include <cstdlib>
+#include <array>
 #include <iostream>
 #include <random>
 #include <sys/mman.h>
 #include <unistd.h>
 
 using namespace fplussearch;
+
+uint64_t reference_fit_bits(const uint64_t* planes, uint32_t n, const Token* const* toks, size_t nt) {
+  uint64_t hits = 0;
+  for (size_t t = 0; t < nt; ++t) {
+    const Token& token = *toks[t];
+    uint64_t zero = ~uint64_t(0), one = 0, required = ~uint64_t(0);
+    uint64_t mask = token.mask;
+    while (mask) {
+      const unsigned bit = std::countr_zero(mask);
+      const uint64_t present = planes[bit];
+      one = (one & present) | (zero & ~present);
+      zero &= present;
+      if (!(token.loose & (uint64_t(1) << bit))) required &= present;
+      mask &= mask - 1;
+    }
+    uint64_t starts = 0, start = token.start;
+    while (start) {
+      starts |= planes[std::countr_zero(start)];
+      start &= start - 1;
+    }
+    hits |= zero | (one & required & starts);
+  }
+  return n == 64 ? hits : hits & ((uint64_t(1) << n) - 1);
+}
 
 size_t naive_find(std::string_view name, std::string_view query) {
   if (query.size() > name.size()) return std::string_view::npos;
@@ -23,6 +48,27 @@ size_t naive_find(std::string_view name, std::string_view query) {
 }
 
 int main() {
+  std::mt19937_64 bits_random(71231);
+  for (size_t trial = 0; trial < 10000; ++trial) {
+    std::array<uint64_t, 64> planes;
+    for (auto& plane : planes) plane = bits_random();
+    std::array<Token, 4> tokens;
+    std::array<const Token*, 4> pointers;
+    const size_t nt = 1 + bits_random() % tokens.size();
+    for (size_t i = 0; i < nt; ++i) {
+      tokens[i].mask = bits_random() & ((uint64_t(1) << 41) - 1);
+      if (!tokens[i].mask) tokens[i].mask = 1;
+      tokens[i].loose = trial & 1 ? bits_random() & tokens[i].mask : 0;
+      tokens[i].start = bits_random() & ~((uint64_t(1) << 41) - 1);
+      pointers[i] = &tokens[i];
+    }
+    const uint32_t n = 1 + bits_random() % 64;
+    if (fit_bits(planes.data(), n, pointers.data(), nt) !=
+        reference_fit_bits(planes.data(), n, pointers.data(), nt)) {
+      std::cerr << "fit_bits differential mismatch: " << trial << '\n';
+      return EXIT_FAILURE;
+    }
+  }
   const size_t page = size_t(sysconf(_SC_PAGESIZE));
   void* mapping = mmap(nullptr, page * 3, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
   if (mapping == MAP_FAILED) return EXIT_FAILURE;

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <ctime>
 #include <functional>
@@ -322,14 +323,30 @@ uint64_t fit_bits(const uint64_t* planes, uint32_t n, const Token* const* toks, 
   uint64_t hits = 0;
   for (size_t t = 0; t < nt; ++t) {
     const Token& token = *toks[t];
-    uint64_t zero = ~uint64_t(0), one = 0, required = ~uint64_t(0);
     uint64_t mask = token.mask;
+    // Exact/prefix/suffix tokens do not need typo bookkeeping.
+    if (token.loose == 0) {
+      uint64_t candidate = ~uint64_t(0);
+      while (mask) {
+        candidate &= planes[std::countr_zero(mask)];
+        mask &= mask - 1;
+      }
+      hits |= candidate;
+      continue;
+    }
+    uint64_t required = ~uint64_t(0);
+    mask = token.mask & ~token.loose;
     while (mask) {
-      const unsigned bit = std::countr_zero(mask);
-      const uint64_t present = planes[bit];
-      one = (one & present) | (zero & ~present);
+      required &= planes[std::countr_zero(mask)];
+      mask &= mask - 1;
+    }
+    // Track zero and at most one missing class; required classes stay present.
+    uint64_t zero = required, one = required;
+    mask = token.mask & token.loose;
+    while (mask) {
+      const uint64_t present = planes[std::countr_zero(mask)];
+      one = (one & present) | zero;
       zero &= present;
-      if (!(token.loose & (uint64_t(1) << bit))) required &= present;
       mask &= mask - 1;
     }
     uint64_t starts = 0, start = token.start;
@@ -337,7 +354,7 @@ uint64_t fit_bits(const uint64_t* planes, uint32_t n, const Token* const* toks, 
       starts |= planes[std::countr_zero(start)];
       start &= start - 1;
     }
-    hits |= zero | (one & required & starts);
+    hits |= zero | (one & starts);
   }
   return n == 64 ? hits : hits & ((uint64_t(1) << n) - 1);
 }
@@ -595,11 +612,16 @@ struct Scan {
       if (!hits) continue;
       const char* bs = s.bytes.p + s.block_off[blk];
       const char* be = s.bytes.p + s.block_off[blk + 1];
-      uint32_t e = s.block_first[blk];
       uint32_t i = 0;
+      uint32_t e = s.name_first ? 0 : s.block_first[blk];
       while (hits) {
         const uint32_t next = uint32_t(__builtin_ctzll(hits));
-        for (; i < next; ++i) e += s.count(u0 + i);
+        if (s.name_first) {
+          i = next;
+          e = (*s.name_first)[u0 + i];
+        } else {
+          for (; i < next; ++i) e += s.count(u0 + i);
+        }
         const uint32_t k = u0 + i;
         const uint32_t c = s.count(k);
         std::string_view nm;
@@ -613,7 +635,7 @@ struct Scan {
           nm = {p, size_t(end - p)};
         }
         visit(e, c, nm, masks[i]);
-        e += c;
+        if (!s.name_first) e += c;
         ++i;
         hits &= hits - 1;
       }
@@ -985,7 +1007,17 @@ Query parse_query(std::string_view text, std::string_view home) {
       } else if (key == "in") {
         std::string p(raw);
         if (p.starts_with('~')) p = std::string(home) + p.substr(1);
-        if (char* real = realpath(p.c_str(), nullptr)) {  // the index holds real paths: /etc is /private/etc
+        struct ScopeCache {
+          std::string path, resolved;
+          std::chrono::steady_clock::time_point expires;
+        };
+        static thread_local ScopeCache cache;
+        const auto now = std::chrono::steady_clock::now();
+        // shortcut: scope symlink changes can lag one second, use event invalidation if instant retargeting is needed.
+        if (p.starts_with('/') && p == cache.path && now < cache.expires) {
+          p = cache.resolved;
+        } else if (char* real = realpath(p.c_str(), nullptr)) {
+          if (p.starts_with('/')) cache = {p, real, now + std::chrono::seconds(1)};
           p = real;
           std::free(real);
         }

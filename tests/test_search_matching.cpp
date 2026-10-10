@@ -1,6 +1,11 @@
 #include "search.hpp"
 
 #include <cstdlib>
+#include <chrono>
+#include <filesystem>
+#include <thread>
+#include <unistd.h>
+#include <cassert>
 #include <iostream>
 #include <string_view>
 
@@ -37,5 +42,23 @@ int main() {
       return EXIT_FAILURE;
     }
   }
+  char temporary[] = "/tmp/fplus-scope-XXXXXX";
+  assert(mkdtemp(temporary));
+  const std::filesystem::path root = std::filesystem::canonical(temporary);
+  const auto a = root / "a", b = root / "b", link = root / "link", missing = root / "missing";
+  std::filesystem::create_directory(a);
+  std::filesystem::create_directory(b);
+  std::filesystem::create_directory_symlink(a, link);
+  const std::string scoped = "in:" + link.string() + " readme";
+  assert(parse_query(scoped).scope == a.string());
+  std::filesystem::remove(link);
+  std::filesystem::create_directory_symlink(b, link);
+  assert(parse_query(scoped).scope == a.string());
+  std::this_thread::sleep_for(std::chrono::milliseconds(1050));
+  assert(parse_query(scoped).scope == b.string());
+  assert(parse_query("in:" + missing.string()).scope == missing.string());
+  std::filesystem::create_directory_symlink(a, missing);
+  assert(parse_query("in:" + missing.string()).scope == a.string());
+  std::filesystem::remove_all(root);
   std::cout << "Search matching regression checks passed\n";
 }

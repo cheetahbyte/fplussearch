@@ -36,6 +36,7 @@ struct DocIn {
   std::string_view path;  // into a PathArena
   uint64_t size;
   uint32_t mtime;
+  uint64_t mtime_ns = 0, ctime_ns = 0;
 };
 
 // Paths stored back to back: a million of them as separate strings would
@@ -73,6 +74,46 @@ constexpr uint64_t kBatchBytes = uint64_t(32) << 20;  // file bytes per segment 
 constexpr size_t kMergeTier = 8;             // segments of a size tier merged into one
 constexpr uint64_t kMergeCap = uint64_t(256) << 20;  // largest merge, in posting bytes
 constexpr size_t kMaxSegments = 6;
+struct Bloom {
+  std::vector<uint64_t> short_bits, long_bits;
+};
+struct BloomView { std::span<const uint64_t> short_bits, long_bits; uint64_t mtime_ns = 0, ctime_ns = 0; };
+uint64_t time_ns(const timespec& t) { return uint64_t(t.tv_sec) * 1000000000ull + uint64_t(t.tv_nsec); }
+
+uint32_t gram_hash(const char* p, size_t n) {
+  uint32_t h = 2166136261u;
+  for (size_t i = 0; i < n; ++i) h = (h ^ kFold[uint8_t(p[i])]) * 16777619u;
+  return h;
+}
+
+void bloom_set(std::vector<uint64_t>& b, uint32_t h) {
+  const size_t words = b.size();
+  const size_t a = (uint64_t(h) * words * 64) >> 32;
+  const size_t c = (uint64_t(h * 0x9e3779b1u) * words * 64) >> 32;
+  b[a / 64] |= uint64_t(1) << (a % 64);
+  b[c / 64] |= uint64_t(1) << (c % 64);
+}
+
+bool bloom_has(std::span<const uint64_t> b, uint32_t h) {
+  const size_t words = b.size();
+  if (!words) return true;
+  const size_t a = (uint64_t(h) * words * 64) >> 32;
+  const size_t c = (uint64_t(h * 0x9e3779b1u) * words * 64) >> 32;
+  return (b[a / 64] >> (a % 64) & 1) && (b[c / 64] >> (c % 64) & 1);
+}
+
+void make_bloom(std::string_view s, Bloom& b) {
+  std::vector<uint32_t> h[2];
+  for (size_t n : {size_t(5), size_t(7)}) {
+    auto& v = h[n == 5 ? 0 : 1];
+    for (size_t i = 0; i + n <= s.size(); ++i) v.push_back(gram_hash(s.data() + i, n));
+    std::sort(v.begin(), v.end());
+    v.erase(std::unique(v.begin(), v.end()), v.end());
+    auto& bits = n == 5 ? b.short_bits : b.long_bits;
+    bits.assign(std::max<size_t>(1, (v.size() * 3 + 63) / 64), 0);
+    for (uint32_t x : v) bloom_set(bits, x);
+  }
+}
 
 uint8_t fold(uint8_t b) { return kFold[b]; }
 
@@ -627,6 +668,8 @@ struct ContentIndex::Segment {
   Span<char> paths;
   Span<uint64_t> size;
   Span<int8_t> rank;
+  std::shared_ptr<const std::vector<BloomView>> blooms;
+  std::shared_ptr<const void> bloom_backing;
 
   std::string_view path(uint32_t d) const { return {paths.p + path_off[d], path_off[d + 1] - path_off[d]}; }
 
@@ -686,6 +729,14 @@ struct ContentIndex::Segment {
   bool is_bitset(size_t k) const { return off[k] & kBitset; }
   bool has(size_t k, uint32_t d) const {  // bitset lists only
     return (post.p[(off[k] & ~kBitset) + d / 8] >> (d % 8)) & 1;
+  }
+
+  bool may_contain(uint32_t d, const std::vector<std::pair<uint32_t, uint8_t>>& probes) const {
+    if (!blooms) return true;  // Segments written before the bloom sidecar.
+    const BloomView& b = (*blooms)[d];
+    for (auto [h, which] : probes)
+      if (!bloom_has(which ? b.long_bits : b.short_bits, h)) return false;
+    return true;
   }
 };
 
@@ -749,7 +800,52 @@ std::shared_ptr<ContentIndex::Segment> map_segment(const std::string& dir, uint6
                   seg->off.n == seg->key.n + 1 && seg->path_off.n == size_t(seg->ndocs) + 1 &&
                   seg->size.n == seg->ndocs && seg->mtime.n == seg->ndocs && seg->by_path.n == seg->ndocs &&
                   seg->rank.n == seg->ndocs;
-  return ok ? seg : nullptr;
+  if (!ok) return nullptr;
+  const int bf = open(seg_file(dir, id, "blm").c_str(), O_RDONLY | O_CLOEXEC);
+  if (bf >= 0) {
+    struct stat bst{};
+    if (fstat(bf, &bst) == 0 && bst.st_size >= 8 + int64_t(seg->ndocs) * 24) {
+      const size_t length = size_t(bst.st_size);
+      void* mapped = mmap(nullptr, length, PROT_READ, MAP_SHARED, bf, 0);
+      if (mapped != MAP_FAILED) {
+        auto backing = std::shared_ptr<const void>(mapped, [length](const void* p) { munmap(const_cast<void*>(p), length); });
+        const char* data = static_cast<const char*>(mapped);
+        uint32_t magic, n;
+        std::memcpy(&magic, data, 4);
+        std::memcpy(&n, data + 4, 4);
+        if (magic == 0x334d4c42u && n == seg->ndocs) {
+          auto blooms = std::make_shared<std::vector<BloomView>>(n);
+          size_t at = 8;
+          bool valid = true;
+          for (auto& r : *blooms) {
+            if (length - at < 24) { valid = false; break; }
+            uint32_t sw, lw;
+            std::memcpy(&sw, data + at, 4);
+            std::memcpy(&lw, data + at + 4, 4);
+            std::memcpy(&r.mtime_ns, data + at + 8, 8);
+            std::memcpy(&r.ctime_ns, data + at + 16, 8);
+            at += 24;
+            constexpr size_t max_words = (kMaxContentFile * 3 + 63) / 64;
+            if (sw > max_words || lw > max_words || uint64_t(sw) * 8 + uint64_t(lw) * 8 > length - at) {
+              valid = false;
+              break;
+            }
+            r.short_bits = {reinterpret_cast<const uint64_t*>(data + at), sw};
+            at += size_t(sw) * 8;
+            r.long_bits = {reinterpret_cast<const uint64_t*>(data + at), lw};
+            at += size_t(lw) * 8;
+          }
+          if (valid && at == length) {
+            seg->blooms = std::move(blooms);
+            seg->bloom_backing = std::move(backing);
+            seg->bytes += length;
+          }
+        }
+      }
+    }
+    close(bf);
+  }
+  return seg;
 }
 
 std::vector<uint64_t> load_dead(const std::string& dir, uint64_t id, uint32_t ndocs) {
@@ -792,7 +888,8 @@ struct DocMeta {
 template <typename Next>
 // Writes a segment, streaming the postings to the file as `next` produces
 // them (they are the bulk of it), so a big segment never sits in memory.
-bool write_segment(const std::string& dir, uint64_t id, const std::vector<DocMeta>& docs, Next&& next) {
+bool write_segment(const std::string& dir, uint64_t id, const std::vector<DocMeta>& docs, Next&& next,
+                   std::span<const BloomView> blooms = {}) {
   const uint32_t ndocs = uint32_t(docs.size());
   FieldWriter w(seg_file(dir, id, "fpc"), kMagic, kFields);
   BigVec<uint32_t> keys, off;
@@ -850,7 +947,24 @@ bool write_segment(const std::string& dir, uint64_t id, const std::vector<DocMet
   w.write(kRank, rank.data(), rank.size());
   std::array<uint64_t, 8> meta{};
   meta[0] = ndocs;
-  return w.finish(meta);
+  if (!w.finish(meta)) return false;
+  if (!blooms.empty() && blooms.size() == docs.size()) {
+    const std::string file = seg_file(dir, id, "blm"), tmp = file + ".tmp";
+    const int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd >= 0) {
+      const uint32_t hdr[2] = {0x334d4c42u, uint32_t(blooms.size())};
+      bool ok = write(fd, hdr, sizeof hdr) == ssize_t(sizeof hdr);
+      for (const auto& r : blooms) {
+        const uint32_t sw = uint32_t(r.short_bits.size()), lw = uint32_t(r.long_bits.size());
+        ok = ok && write(fd, &sw, 4) == 4 && write(fd, &lw, 4) == 4 && write(fd, &r.mtime_ns, 8) == 8 && write(fd, &r.ctime_ns, 8) == 8 &&
+             write(fd, r.short_bits.data(), size_t(sw) * 8) == ssize_t(size_t(sw) * 8) &&
+             write(fd, r.long_bits.data(), size_t(lw) * 8) == ssize_t(size_t(lw) * 8);
+      }
+      close(fd);
+      if (!ok || rename(tmp.c_str(), file.c_str()) != 0) unlink(tmp.c_str());
+    }
+  }
+  return true;
 }
 
 void set_background(bool background) {
@@ -923,6 +1037,7 @@ bool ContentIndex::open() {
       const size_t live = live_count(*dead, seg->ndocs);
       s->segs.push_back({std::move(seg), std::move(dead), live});
       keep.insert(seg_file("", id, "fpc").substr(1));
+      keep.insert(seg_file("", id, "blm").substr(1));
       keep.insert(seg_file("", id, "dead").substr(1));
       next_id_ = std::max<uint64_t>(next_id_, id + 1);
     }
@@ -975,6 +1090,8 @@ void ContentIndex::add_docs(std::vector<DocIn>& docs, bool background) {
       int8_t rank = kNotText;
       uint64_t size = 0;
       uint32_t mtime = 0;
+      Bloom bloom;
+      uint64_t mtime_ns = 0, ctime_ns = 0;
     };
     std::vector<Run> runs(n);
     parallel(n, threads, background, 16, [&](unsigned t, size_t i) {
@@ -987,8 +1104,11 @@ void ContentIndex::add_docs(std::vector<DocIn>& docs, bool background) {
       struct stat st{};
       if (!read_file(std::string(d.path).c_str(), L.buf, kMaxContentFile + 1, &st)) return;
       r.size = uint64_t(st.st_size), r.mtime = uint32_t(st.st_mtimespec.tv_sec);
+      r.mtime_ns = time_ns(st.st_mtimespec);
+      r.ctime_ns = time_ns(st.st_ctimespec);
       if (L.buf.size() > kMaxContentFile || looks_binary(L.buf)) return;
       trigrams(L.buf.data(), L.buf.size(), L.scratch, L.flat);
+      make_bloom(std::string_view(L.buf.data(), L.buf.size()), r.bloom);
       r.len = uint32_t(L.flat.size() - r.start);
       r.rank = doc_rank(d.path);
     });
@@ -1038,7 +1158,9 @@ void ContentIndex::add_docs(std::vector<DocIn>& docs, bool background) {
       start[0] = 0;
     };
     std::vector<DocMeta> meta(n);
+    std::vector<BloomView> blooms(n);
     for (size_t i = 0; i < n; ++i) meta[i] = {docs[b0 + i].path, runs[i].size, runs[i].mtime, runs[i].rank};
+    for (size_t i = 0; i < n; ++i) blooms[i] = {runs[i].bloom.short_bits, runs[i].bloom.long_bits, runs[i].mtime_ns, runs[i].ctime_ns};
     const uint64_t id = next_id();
     size_t k = 0;
     uint32_t shard = 0;
@@ -1054,7 +1176,7 @@ void ContentIndex::add_docs(std::vector<DocIn>& docs, bool background) {
       masks = std::span<const uint8_t>(raw_mask.data(), raw_mask.size()).subspan(start[k], start[k + 1] - start[k]);
       ++k;
       return true;
-    });
+    }, blooms);
     for (Local& L : locals) BigVec<uint32_t>().swap(L.flat);
     if (ok)
       if (auto seg = map_segment(dir_, id)) {
@@ -1104,6 +1226,8 @@ void ContentIndex::maybe_merge() {
     }
     if (group.empty()) return;
     std::vector<DocMeta> meta;
+    std::vector<BloomView> blooms;
+    bool all_blooms = true;
     std::vector<std::vector<uint32_t>> remap;
     for (size_t gi : group) {
       const SegView& v = cur->segs[gi];
@@ -1112,6 +1236,8 @@ void ContentIndex::maybe_merge() {
         if (v.is_dead(d)) continue;
         r[d] = uint32_t(meta.size());
         meta.push_back({v.seg->path(d), v.seg->size[d], v.seg->mtime[d], v.seg->rank[d]});
+        blooms.push_back(v.seg->blooms ? (*v.seg->blooms)[d] : BloomView{});
+        all_blooms = all_blooms && bool(v.seg->blooms);
       }
       remap.push_back(std::move(r));
     }
@@ -1147,7 +1273,7 @@ void ContentIndex::maybe_merge() {
           return true;
         }
       }
-    });
+    }, all_blooms ? std::span<const BloomView>(blooms) : std::span<const BloomView>());
     auto seg = ok ? map_segment(dir_, id) : nullptr;
     // Writers are serialized, so nothing was killed in the group meanwhile.
     auto next = std::make_shared<State>();
@@ -1165,7 +1291,8 @@ void ContentIndex::maybe_merge() {
     }
     save_manifest(*next);
     publish(std::move(next));
-    for (uint64_t g : gone) unlink(seg_file(dir_, g, "fpc").c_str()), unlink(seg_file(dir_, g, "dead").c_str());
+    for (uint64_t g : gone)
+      unlink(seg_file(dir_, g, "fpc").c_str()), unlink(seg_file(dir_, g, "dead").c_str()), unlink(seg_file(dir_, g, "blm").c_str());
   }
 }
 
@@ -1250,7 +1377,14 @@ void ContentIndex::sync(const Index& ix, bool background, ScanProgress* progress
       const Segment& s = *cur->segs[h.seg].seg;
       // Not-text docs keep their stat from when they were read; recheck
       // them only when the file index reports a change.
-      if (s.size[h.doc] != want[i].size || s.mtime[h.doc] != want[i].mtime) {
+      bool changed = !s.blooms || s.size[h.doc] != want[i].size || s.mtime[h.doc] != want[i].mtime;
+      if (!changed && s.rank[h.doc] != kNotText) {
+        struct stat current{};
+        changed = stat(std::string(h.path).c_str(), &current) != 0 ||
+                  time_ns(current.st_mtimespec) != (*s.blooms)[h.doc].mtime_ns ||
+                  time_ns(current.st_ctimespec) != (*s.blooms)[h.doc].ctime_ns;
+      }
+      if (changed) {
         kill(h);
         want[todo++] = want[i];
       }
@@ -1302,7 +1436,8 @@ void ContentIndex::update_paths(const std::vector<std::string>& dirs, const std:
         if (S_ISDIR(st.st_mode)) {
           if (recursive && !skip_dir(std::string_view(p).substr(home_.size() + 1), name)) stack.push_back(p);
         } else if (S_ISREG(st.st_mode) && file_ok(name, uint64_t(st.st_size))) {
-          want.push_back({arena.add(p), uint64_t(st.st_size), uint32_t(st.st_mtimespec.tv_sec)});
+          want.push_back({arena.add(p), uint64_t(st.st_size), uint32_t(st.st_mtimespec.tv_sec),
+                          time_ns(st.st_mtimespec), time_ns(st.st_ctimespec)});
         }
       }
       closedir(h);
@@ -1329,7 +1464,8 @@ void ContentIndex::update_paths(const std::vector<std::string>& dirs, const std:
         if (!recursive && p.find('/', lo.size()) != std::string_view::npos) continue;
         if (v.is_dead(d)) continue;
         const auto w = std::lower_bound(want.begin(), want.end(), p, [](const DocIn& a, std::string_view x) { return a.path < x; });
-        if (w != want.end() && w->path == p && w->size == s.size[d] && w->mtime == s.mtime[d]) {
+        if (s.blooms && w != want.end() && w->path == p && w->size == s.size[d] &&
+            w->mtime_ns == (*s.blooms)[d].mtime_ns && w->ctime_ns == (*s.blooms)[d].ctime_ns) {
           held[size_t(w - want.begin())] = true;
           continue;
         }
@@ -1519,6 +1655,12 @@ GrepResult ContentIndex::grep(const GrepOptions& o) const {
   Matcher m;
   if (!make_matcher(o, m, r.error)) return r;
   const TQ plan = o.regex ? RegexPlanner(o.pattern).plan() : literal_plan(o.pattern);
+  std::vector<std::pair<uint32_t, uint8_t>> bloom_probes;
+  if (!o.regex) {
+    for (size_t n : {size_t(5), size_t(7)})
+      for (size_t i = 0; i + n <= o.pattern.size(); ++i)
+        bloom_probes.push_back({gram_hash(o.pattern.data() + i, n), n == 5 ? 0 : 1});
+  }
   auto st = state();
   std::string scope = o.scope;
   while (scope.size() > 1 && scope.back() == '/') scope.pop_back();
@@ -1539,6 +1681,7 @@ GrepResult ContentIndex::grep(const GrepOptions& o) const {
       const std::string_view p = s.path(d);
       if (!lo.empty() && !p.starts_with(lo)) return;
       if (o.keep && !o.keep(p)) return;
+      if (!bloom_probes.empty() && !s.may_contain(d, bloom_probes)) return;
       per[si].push_back({p, s.rank[d], s.mtime[d]});
     };
     if (auto ids = eval(s, plan)) {

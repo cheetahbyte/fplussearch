@@ -244,6 +244,16 @@ Naive worker-batch reuse can race with workers leaving the claim loop; fewer all
 
 ## CPU profile findings
 
+Fresh profiles after the NEON tail change use the same filename and grep requests as the updated fsearch comparison.
+Of non-yield filename query samples, Linux spends 40% in `fit_bits` and 17% in candidate enumeration.
+Chromium spends 22% in candidate enumeration, 15% in `fit_bits`, and 13% in `find_ci`, plus 4% in its block helper.
+Content query samples concentrate at file opens (82-85%), not posting intersections or candidate sorting.
+Diagnostic counters show about 9× more fresh-file checks on Linux and 14.5× on Chromium than fsearch.
+A temporary four-reader variant reduces diagnostic grep medians without changing results; it is not retained without an acceptance benchmark.
+See the [search performance gap investigation](profiling/fsearch_gap.md) for code differences, counters, scope-resolution caching, and coverage limitations.
+
+### Earlier captures
+
 After bit-plane filtering, Linux filename query stacks concentrate in candidate filtering and fuzzy scoring.
 Chromium filename stacks concentrate in substring and fuzzy scoring.
 Content verification spends about 89-92% of query-stack sampled weight in file reads, mostly file opens; posting intersection is below 0.1%.

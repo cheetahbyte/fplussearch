@@ -109,6 +109,8 @@ def run(root, harness, temp, baseline=None, rounds=1, only=None):
         names = [n for n in ["fsearch", "fplussearch", "baseline"] if n in clients]
         name_digests = {n: hashlib.sha256() for n in names}
         content_digests = {n: hashlib.sha256() for n in names}
+        limited_content_digests = {n: hashlib.sha256() for n in names}
+        verification_counts = {n: [] for n in names}
         round_timings = []
         name_parity = True
         for i, (query, target) in enumerate(queries * rounds):
@@ -136,8 +138,10 @@ def run(root, harness, temp, baseline=None, rounds=1, only=None):
             if i % 2:
                 order = order[::-1]
             for name in order:
-                ms, _ = clients[name].call(req)
+                ms, response = clients[name].call(req)
                 timings[name]["grep"].append(ms)
+                limited_content_digests[name].update(json.dumps(response["files"], sort_keys=True).encode())
+                verification_counts[name].append({"pattern": pattern, "read": response.get("read"), "candidates": response.get("candidates")})
             sample_memory()
             if i >= len(patterns):
                 continue
@@ -163,6 +167,8 @@ def run(root, harness, temp, baseline=None, rounds=1, only=None):
         result["baseline_parity"] = name_parity if compare_baseline else None
         result["name_results_digest"] = {n: digest.hexdigest() for n, digest in name_digests.items()}
         result["content_results_digest"] = {n: digest.hexdigest() for n, digest in content_digests.items()}
+        result["limited_content_results_digest"] = {n: digest.hexdigest() for n, digest in limited_content_digests.items()}
+        result["verification_counts"] = verification_counts
         result["coverage"] = coverage
         result["results"] = {n: {**{k + "_ms": stats(v) for k, v in timings[n].items()}, **{k + "_top1": a / b for k, (a, b) in scores[n].items()}} for n in names}
         return result
@@ -212,7 +218,7 @@ def main():
         if allocator is None:
             raise RuntimeError("fsearch production allocator missing")
         (crate / "src/main.rs").write_text("use std::alloc::{GlobalAlloc, Layout, System};\n" + allocator.group(0) + Path("benchmarks/fsearch-harness.rs").read_text())
-        subprocess.run(["cargo", "build", "--release", "--manifest-path", str(crate / "Cargo.toml")], check=True)
+        subprocess.run(["cargo", "build", "--release", "--manifest-path", str(crate / "Cargo.toml")], cwd=args.fsearch.resolve(), check=True)
         output = {"method": "folder-local indexes; Unix socket round-trip; seed 1; 50 results; unlimited content budget; " + ("one engine process at a time" if args.isolate else "concurrent processes; rotating request order"), "commits": {n: subprocess.check_output(["git", "-C", p, "rev-parse", "HEAD"], text=True).strip() for n, p in (("fplussearch", "."), ("fsearch", str(args.fsearch)))}, "machine": subprocess.check_output(["sysctl", "hw.model", "hw.memsize", "hw.ncpu", "machdep.cpu.brand_string"], text=True).strip(), "datasets": {}}
         for name in ("linux", "chromium"):
             directory = temp / name
@@ -230,13 +236,13 @@ def main():
                     runs[variant] = run(root, harness, variant_dir, args.baseline, args.rounds, variant)
                     print(name, variant, json.dumps(runs[variant]["results"][variant]), flush=True)
                 merged = dict(runs["fplussearch"])
-                for key in ("status", "results", "memory", "name_results_digest", "content_results_digest"):
+                for key in ("status", "results", "memory", "name_results_digest", "content_results_digest", "limited_content_results_digest", "verification_counts"):
                     merged[key] = {n: runs[n][key][n] for n in runs}
                 merged["round_results"] = [{n: runs[n]["round_results"][i][n] for n in runs} for i in range(args.rounds)]
                 merged["pattern_timings"] = {p: {n: runs[n]["pattern_timings"][p][n] for n in runs} for p in merged["patterns"]}
                 merged["coverage"] = [{"pattern": p, **{n: runs[n]["coverage"][i][n] for n in runs}} for i, p in enumerate(merged["patterns"])]
                 if args.baseline:
-                    for key in ("name_results_digest", "content_results_digest"):
+                    for key in ("name_results_digest", "content_results_digest", "limited_content_results_digest"):
                         if merged[key]["baseline"] != merged[key]["fplussearch"]:
                             raise RuntimeError(f"isolated baseline parity failed: {key}")
                     merged["baseline_parity"] = True

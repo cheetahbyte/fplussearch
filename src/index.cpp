@@ -126,6 +126,17 @@ bool attach(Index& ix, Fields&& f) {
   r.bytes = f.bytes;
   r.backing = std::move(f.backing);
   for (auto& s : r.sections) {
+    auto first = std::make_shared<std::vector<uint32_t>>(s.names());
+    for (uint32_t b = 0; b < s.blocks(); ++b) {
+      uint32_t e = s.block_first[b];
+      const uint32_t begin = b * kBlock;
+      const uint32_t end = std::min<uint32_t>(begin + kBlock, s.names());
+      for (uint32_t i = begin; i < end; ++i) {
+        (*first)[i] = e;
+        e += s.count(i);
+      }
+    }
+    s.name_first = std::move(first);
     auto planes = std::make_shared<std::vector<std::array<uint64_t, kBlock>>>(
         (size_t(s.names()) + kBlock - 1) / kBlock);
     for (uint32_t i = 0; i < s.names(); ++i) {
