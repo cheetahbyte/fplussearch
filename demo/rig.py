@@ -27,21 +27,37 @@ class DaemonClient:
     def __init__(self, binary_path: str, root_path: str = "/"):
         self.tmp = tempfile.TemporaryDirectory(prefix="fpr-", dir="/tmp")
         self.home = Path(self.tmp.name)
-        self.cache_dir = self.home / "Library/Caches/fplussearch"
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Link existing master cache so the daemon starts up in milliseconds
-        master_cache = Path(os.environ.get("HOME", "")) / "Library/Caches/fplussearch"
-        if master_cache.is_dir():
-            for f in master_cache.glob("index_*"):
-                try:
-                    os.symlink(f, self.cache_dir / f.name)
-                except OSError:
-                    pass
+        self.is_fsearch = "fsearch" in Path(binary_path).name and "fplussearch" not in Path(binary_path).name
+
+        real_home = Path(os.environ.get("HOME", ""))
+        if self.is_fsearch:
+            self.app_dir = self.home / "Library/Application Support/FSearch"
+            self.app_dir.mkdir(parents=True, exist_ok=True)
+            master_dir = real_home / "Library/Application Support/FSearch"
+            if master_dir.is_dir():
+                for item in master_dir.iterdir():
+                    if item.name.endswith(".sock") or item.name.endswith(".lock"):
+                        continue
+                    try:
+                        os.symlink(item, self.app_dir / item.name)
+                    except OSError:
+                        pass
+            cmd = [binary_path, "serve"]
+        else:
+            self.cache_dir = self.home / "Library/Caches/fplussearch"
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            master_cache = real_home / "Library/Caches/fplussearch"
+            if master_cache.is_dir():
+                for f in master_cache.glob("index_*"):
+                    try:
+                        os.symlink(f, self.cache_dir / f.name)
+                    except OSError:
+                        pass
+            cmd = [binary_path, "serve", "--root", root_path, "--no-rescan"]
 
         self.log_file = open(self.home / "daemon.log", "w+")
         self.proc = subprocess.Popen(
-            [binary_path, "serve", "--root", root_path, "--no-rescan"],
+            cmd,
             env={**os.environ, "HOME": str(self.home)},
             stdout=self.log_file,
             stderr=self.log_file
@@ -49,11 +65,12 @@ class DaemonClient:
         
         deadline = time.monotonic() + 30
         self.sock = None
+        sock_search_dir = self.app_dir if self.is_fsearch else self.cache_dir
         while time.monotonic() < deadline:
             if self.proc.poll() is not None:
                 self.log_file.seek(0)
                 raise RuntimeError(f"Daemon exited: {self.log_file.read()[-2000:]}")
-            socks = list(self.cache_dir.glob("*.sock"))
+            socks = list(sock_search_dir.glob("*.sock"))
             if socks:
                 try:
                     s = socket.socket(socket.AF_UNIX)
@@ -72,9 +89,16 @@ class DaemonClient:
         # Wait for daemon readiness
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
-            res = self.call({"op": "status"})
-            if res.get("ready") and not res.get("busy"):
-                break
+            try:
+                res = self.call({"op": "status"})
+                if res.get("ok"):
+                    if not self.is_fsearch:
+                        if res.get("ready") and not res.get("busy"):
+                            break
+                    else:
+                        break
+            except RuntimeError:
+                pass
             time.sleep(0.05)
 
     def call(self, req: dict):
@@ -122,7 +146,8 @@ class DaemonClient:
         h = 0xcbf29ce484222325
         for f in res.get("files", []):
             h = fnv64(f.get("path", "").encode(), h)
-            for line in f.get("lines", []):
+            lines = f.get("lines") or f.get("matches", [])
+            for line in lines:
                 h = fnv64(line.get("line", 0).to_bytes(4, "little"), h)
                 h = fnv64(line.get("text", "").encode(), h)
         return ms, h
