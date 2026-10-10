@@ -276,27 +276,32 @@ size_t find_ci(std::string_view name, std::string_view q) {
 #if defined(__ARM_NEON)
   const uint8x16_t F = vdupq_n_u8(first), L = vdupq_n_u8(end);
   const uint8x16_t FM = vdupq_n_u8(fm), LM = vdupq_n_u8(lm);
-  auto block = [&](size_t start, uint64_t keep) {
-    const auto* p = reinterpret_cast<const uint8_t*>(name.data() + start);
+  const size_t q_end_off = q.size() - 1;
+  for (; i <= last && last - i >= 15; i += 16) {
+    const auto* p = reinterpret_cast<const uint8_t*>(name.data() + i);
     const uint8x16_t matches = vandq_u8(
         vceqq_u8(vorrq_u8(vld1q_u8(p), FM), F),
-        vceqq_u8(vorrq_u8(vld1q_u8(p + q.size() - 1), LM), L));
-    uint64_t bits = lane_bits(matches) & keep;
+        vceqq_u8(vorrq_u8(vld1q_u8(p + q_end_off), LM), L));
+    uint64_t bits = lane_bits(matches);
     while (bits) {
       const size_t offset = size_t(std::countr_zero(bits) >> 2);
-      if (q.size() == 2 || fold_eq(name.data() + start + offset, q)) return start + offset;
+      if (q.size() == 2 || fold_eq(name.data() + i + offset, q)) return i + offset;
+      bits &= ~(uint64_t(0xf) << (offset * 4));
+    }
+  }
+  if (last >= 15 && i <= last) {
+    const size_t j = last - 15;
+    const auto* p = reinterpret_cast<const uint8_t*>(name.data() + j);
+    const uint8x16_t matches = vandq_u8(
+        vceqq_u8(vorrq_u8(vld1q_u8(p), FM), F),
+        vceqq_u8(vorrq_u8(vld1q_u8(p + q_end_off), LM), L));
+    uint64_t bits = lane_bits(matches) & (~uint64_t(0) << (4 * (i - j)));
+    while (bits) {
+      const size_t offset = size_t(std::countr_zero(bits) >> 2);
+      if (q.size() == 2 || fold_eq(name.data() + j + offset, q)) return j + offset;
       bits &= ~(uint64_t(0xf) << (offset * 4));
     }
     return std::string_view::npos;
-  };
-  for (; i <= last && last - i >= 15; i += 16) {
-    const size_t found = block(i, ~uint64_t(0));
-    if (found != std::string_view::npos) return found;
-  }
-  if (last >= 15) {
-    if (i > last) return std::string_view::npos;
-    const size_t j = last - 15;
-    return block(j, ~uint64_t(0) << (4 * (i - j)));
   }
 #endif
   for (; i <= last; ++i)
