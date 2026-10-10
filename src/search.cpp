@@ -443,7 +443,7 @@ struct TopK {
     if (buf.size() <= k) return;
     std::nth_element(buf.begin(), buf.begin() + long(k - 1), buf.end(), std::greater<>());
     buf.resize(k);
-    floor = *std::min_element(buf.begin(), buf.end());
+    floor = buf[k - 1];
   }
 };
 
