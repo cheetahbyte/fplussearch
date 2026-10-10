@@ -1141,7 +1141,7 @@ Results Engine::search(const Index& ix, const Query& q, size_t limit, const Over
     fill_dir_hits(ix, sc, pool_, dir_hits);
     sc.dir_hits = &dir_hits;
   }
-  const std::vector<Job> jobs = scope_new ? std::vector<Job>() : make_jobs(ix, sc, size_t(pool_.size()) * 24);
+  const std::vector<Job> jobs = scope_new ? std::vector<Job>() : make_jobs(ix, sc, size_t(pool_.size()) * 8);
   std::vector<Chunk> out(jobs.size());
   for (auto& c : out) c.top = TopK(limit);
   // Names that can't beat the k-th best result so far are only counted. The

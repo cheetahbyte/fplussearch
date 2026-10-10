@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Reduce ranked filename-search jobs from 24 to eight per worker; three-round Linux measurements show lower median latency, with Chromium validation pending.
+
 - Release temporary filename-index buffers at their last use instead of retaining vector capacity.
 - Parse each source file once per symbol response, preserving hit order and first-definition locations.
 - Traverse small `in:` subtrees directly while retaining global scans for broad scopes.
