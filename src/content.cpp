@@ -607,15 +607,28 @@ size_t find_ci(std::string_view hay, size_t from, std::string_view needle) {
   size_t i = from;
 #if defined(__ARM_NEON)
   const uint8x16_t F = vdupq_n_u8(f), L = vdupq_n_u8(l), FM = vdupq_n_u8(fm), LM = vdupq_n_u8(lm);
-  for (; i + 16 <= last + 1; i += 16) {
+  const size_t end_off = k - 1;
+  for (; i <= last && last - i >= 15; i += 16) {
     const uint8_t* a = reinterpret_cast<const uint8_t*>(hay.data() + i);
-    const uint8x16_t eq = vandq_u8(vceqq_u8(vorrq_u8(vld1q_u8(a), FM), F), vceqq_u8(vorrq_u8(vld1q_u8(a + k - 1), LM), L));
+    const uint8x16_t eq = vandq_u8(vceqq_u8(vorrq_u8(vld1q_u8(a), FM), F), vceqq_u8(vorrq_u8(vld1q_u8(a + end_off), LM), L));
     uint64_t bits = lane_bits(eq);
     while (bits) {
-      const size_t c = i + size_t(__builtin_ctzll(bits) >> 2);
-      if (at(c)) return c;
-      bits &= ~(uint64_t(0xf) << ((c - i) * 4));
+      const size_t offset = size_t(std::countr_zero(bits) >> 2);
+      if (k == 2 || at(i + offset)) return i + offset;
+      bits &= ~(uint64_t(0xf) << (offset * 4));
     }
+  }
+  if (last >= 15 && i <= last) {
+    const size_t j = last - 15;
+    const uint8_t* a = reinterpret_cast<const uint8_t*>(hay.data() + j);
+    const uint8x16_t eq = vandq_u8(vceqq_u8(vorrq_u8(vld1q_u8(a), FM), F), vceqq_u8(vorrq_u8(vld1q_u8(a + end_off), LM), L));
+    uint64_t bits = lane_bits(eq) & (~uint64_t(0) << (4 * (i - j)));
+    while (bits) {
+      const size_t offset = size_t(std::countr_zero(bits) >> 2);
+      if (k == 2 || at(j + offset)) return j + offset;
+      bits &= ~(uint64_t(0xf) << (offset * 4));
+    }
+    return std::string_view::npos;
   }
 #endif
   for (; i <= last; ++i)
