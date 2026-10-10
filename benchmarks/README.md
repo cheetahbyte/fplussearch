@@ -113,6 +113,56 @@ Count checks cover 0, 1, 254, exactly 255, larger overflow counts, and missing o
 Local raw measurements and replay workloads are in `results/count-inline-socket.json` and `results/count-inline-engine.json`.
 Engine response captures use `results/count-inline-*-engine-*.tsv`.
 
+### Fixed-trip overflow lookup experiment
+
+The `find_key` candidate uses a key-independent iteration count and one conditional select per iteration.
+On Apple M4 Pro, Clang already emits conditional selects for the original `std::lower_bound`; the candidate removes one select and some loop bookkeeping rather than eliminating a key-comparison branch.
+
+Six alternating-order microbenchmark pairs on the actual overflow tables, reporting median nanoseconds per call:
+
+| Table | Keys | Before | Candidate | Speed ratio |
+| --- | ---: | ---: | ---: | ---: |
+| Linux filename overflow | 4 | 3.69 ns | 1.01 ns | 3.64× |
+| Chromium directory overflow | 14 | 2.57 ns | 1.59 ns | 1.62× |
+| Chromium filename overflow | 27 | 4.46 ns | 1.98 ns | 2.25× |
+
+Three-round filename socket comparisons against the committed version, repeated in reversed order, increase Linux medians by 1.8% in both orders and Chromium medians by 2.1% and 6.4%.
+Engine-only median changes range from -7.0% to -0.1% on Linux and reverse from +4.5% to -19.5% on Chromium.
+The helper improvement repeats, but these runs do not establish an end-to-end benefit.
+The candidate was reverted; production retains `std::lower_bound`.
+Do not use the helper speed ratios as search speedup claims.
+
+Exhaustive unique-key checks cover table sizes 0-512, hits, gaps, and unsigned 32-bit extremes.
+The candidate returns the last duplicate instead of the first; index writers generate unique keys.
+Ordered baseline/candidate results, scores, and totals match. Both existing tests pass.
+
+Repeated fsearch comparisons put candidate filename medians at 0.051-0.062 ms versus 0.136-0.144 ms on Linux and 0.104-0.106 ms versus 0.364-0.390 ms on Chromium.
+This cross-engine comparison does not establish a gain from the candidate.
+Content coverage still differs for 21 of 67 Linux patterns and 59 of 67 Chromium patterns.
+Local raw data: `results/find-key-{lookup,socket,engine}.json` and `results/find-key-vs-fsearch{,-reverse}.json`.
+
+### Split overflow keys and values experiment
+
+An isolated prototype stores sorted 32-bit keys and parallel 64-bit values, using the fixed-trip lookup.
+It serializes each array separately for filename counts, large file sizes, and symbol occurrences.
+Prototype name and symbol cache magic values are bumped; production formats and code remain unchanged.
+
+A 2×2 microbenchmark separates array layout from lookup algorithm, with all variants non-inlined and identical queries.
+For successful lookups on actual overflow tables, splitting arrays while retaining the fixed-trip algorithm gives speed ratios of 0.96× on Linux (4 keys), 0.98× on Chromium directories (14 keys), and 1.01× on Chromium filenames (27 keys).
+Mixed hits/misses improve, but ordinary count lookups have recorded keys and hit.
+Synthetic million-entry tables show about a 2× layout-only improvement, which does not represent these indexes.
+
+Three-round socket benchmarks against production, repeated in reversed order, change Linux filename medians by +1.1% and -1.1% and Chromium medians by +3.2% and +2.5%.
+Engine-only median changes are +0.5% and +1.3% on Linux, while Chromium reverses from -12.2% to +8.4%.
+No repeatable end-to-end benefit is established; retain the production layout.
+Splitting reduces payload from 16 to 12 bytes per overflow record, but field metadata and alignment increase the Linux cache by 192 bytes and leave the Chromium cache size unchanged.
+
+Ordered results, scores, and totals match. Both existing tests pass on the prototype.
+Additional checks cover unique-key sizes 0-512, unsigned extremes, missing-record fallbacks, mismatched key/value lengths, old-cache rejection, mmap round-trip, refresh across the 255-count boundary, symbol overflow, sparse 5 GiB file sizes, and in-memory fallback.
+
+Local raw data: `results/overflow-soa-{layout,socket,engine}.json` and `results/overflow-soa-layout.tsv`.
+The prototype patch and experiment sources are archived under `results/overflow-soa-experiment/`.
+
 ### Ancestor-exclusion bitmaps
 
 Query-local directory bitmaps avoid repeated ancestor walks for global negation-only queries.
