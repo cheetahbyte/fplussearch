@@ -1360,6 +1360,8 @@ void ContentIndex::update_paths(const std::vector<std::string>& dirs, const std:
 
 namespace {
 
+std::atomic<uint64_t> g_diag_ns{0}, g_diag_lists{0}, g_diag_bytes{0}, g_diag_removed{0}, g_eval_ns{0};
+
 // Docs of segment `s` that may satisfy `q`; nullopt means every doc. Lists
 // are applied smallest first, and a large varint list is skipped once the
 // candidates are few: a superset only costs a read, decoding costs more.
@@ -1423,7 +1425,18 @@ std::optional<std::vector<uint32_t>> eval(const ContentIndex::Segment& s, const 
       std::erase_if(*acc, [&](uint32_t d) { return !s.has(k, d); });
       continue;
     }
-    if (acc->size() <= 4 && s.list_bytes(k) > 4096) continue;
+    if (acc->size() <= 4 && s.list_bytes(k) > 4096) {
+      static const bool full = getenv("FPLUS_FULL_INTERSECT") != nullptr;
+      if (!full) continue;
+      const size_t before = acc->size();
+      const auto d0 = std::chrono::steady_clock::now();
+      s.intersect(k, *acc, need_of(k));
+      g_diag_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - d0).count());
+      g_diag_lists += 1;
+      g_diag_bytes += s.list_bytes(k);
+      g_diag_removed += before - acc->size();
+      continue;
+    }
     s.intersect(k, *acc, need_of(k));
   }
   for (const TQ* c : others) {
