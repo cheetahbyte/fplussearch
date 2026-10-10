@@ -7,7 +7,7 @@ Run commands from the repository root. Requirements: macOS on Apple Silicon, Pyt
 - `benchmark.py`: standalone filename and content latency runner.
 - `compare.py`, `common.py`, `fsearch-harness.rs`: comparison runner and shared tooling.
 - `profiling/`: engine measurement and CPU profiling tools. See the [profiling guide](profiling/README.md).
-- `results/`: raw JSON and replay workloads, ignored except for retained content experiment data.
+- `results/`: ignored raw measurements and replay workloads, created by benchmark commands.
 - `profiles/`: ignored local CPU captures and flamegraphs.
 
 ## Run benchmarks
@@ -229,20 +229,24 @@ These changes do not establish a consistent whole-process memory or content-buil
 | ThinLTO default | Small Chromium benefit; Linux inconclusive, no flag change retained |
 | Linux-trained PGO with ThinLTO | Full-disk query classes and p90 regress |
 
-The [three-position substring experiment](results/find-ci-experiment/README.md) records counters, the prototype, and repeated latency comparisons.
+The historical three-position substring experiment measured counters and repeated latency comparisons.
 The third probe rejects 71% of eligible NEON survivors on Linux and 82% on Chromium, but overall socket medians increase 0.5-1.0%.
 Short filenames never enter NEON. Long-filename gains are small or reverse with invocation order; the third probe is not retained.
 
-The [substring caller investigation](results/find-ci-callers-experiment/README.md) separates clean scoring, typo scoring, and other searches.
+The historical substring caller investigation separated clean scoring, typo scoring, and other searches.
 Typo scoring accounts for 0.127% of substring calls on Linux and 0.046% on Chromium in the same filename workloads.
 Verified position-zero matches can avoid another search. Later verified positions require an earlier-prefix search to preserve first-occurrence scoring.
 A temporary safe-reuse prototype preserves results and scores; no production change or latency claim follows from these counts.
 
-The retained [content experiment data](results/content-experiments.json) includes measurements, replay sources, and the freshness fixture.
-A content K-way merge was investigated but not implemented: sorting was not the measured bottleneck.
+An earlier content experiment investigated a K-way merge but did not implement it: sorting wasn't that workload's measured bottleneck.
 Naive worker-batch reuse can race with workers leaving the claim loop; fewer allocations alone do not justify it.
 
 ## CPU profile findings
+
+The latest full-disk profile identified candidate sorting as a content-search bottleneck.
+The implementation now sorts each segment by integer path order, then merges the sorted segments.
+The local [candidate-sort report](profiles/candidate-sort/profile-report.json) contains per-function CPU samples and repeated ABBA results.
+Older generated measurements and captures have been removed. The dataset-specific findings that follow describe earlier workloads.
 
 Fresh profiles after the NEON tail change use the same filename and grep requests as the updated fsearch comparison.
 Of non-yield filename query samples, Linux spends 40% in `fit_bits` and 17% in candidate enumeration.
