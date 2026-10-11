@@ -5,8 +5,6 @@ Search files, folders, functions, and types through the CLI or daemon.
 
 Inspired by [Noah's Rust file search engine](https://github.com/noahdunnagan/fsearch).
 
-The code in this repository is entirely AI-generated.
-
 ## Install with Homebrew
 
 Requires macOS on Apple Silicon. This repository includes a Homebrew tap.
@@ -172,26 +170,6 @@ Mapped index pages are clean file-backed memory, so macOS can drop them under
 memory pressure and read them back from the cache files. Filename candidate
 bit planes are shared, heap-backed data rebuilt when an index loads.
 See [bit-plane benchmark results](benchmarks/README.md#bit-sliced-candidate-masks) for measurements and memory trade-offs.
-
-## How it works
-
-- Eight indexing threads use `getattrlistbulk(2)` to read directory metadata in batches.
-  Names are deduplicated; mapped build buffers avoid copying.
-- Each name is stored once: 6.35 million entries share 1.44 million names.
-  Sorted name sets map matches directly to contiguous entry ranges.
-  Long lowercase hex names use a separate packed section, skipped by non-hex queries.
-- Immutable bit planes filter candidate names in batches before parallel substring and typo scoring.
-- Substring scoring checks candidate endpoints together, using bounded SIMD loads on ARM NEON. See [substring benchmark results](benchmarks/README.md#bounded-substring-matching).
-  Compact parent, size, and type fields support batched metadata filters.
-- Results rank by match quality, location, recency, and visibility.
-  Score bounds skip candidates that can't reach the top results while still counting matches.
-- FSEvents refreshes changed folders and copies unchanged subtrees from the cache.
-  The saved event ID lets later launches replay only new changes.
-- Interactive-priority search threads spin for 250 ms after searches to avoid idle-core startup delays.
-- Per-language token scanners extract symbols from C, C++, Objective-C, Rust, Go,
-  Python, JavaScript, TypeScript, Swift, Java, Kotlin, C#, Ruby, PHP, Lua, Zig, and shell.
-  Symbol names are deduplicated; line numbers are resolved when displayed.
-  Source reads bypass the file cache to avoid evicting other cached files.
 
 ## Limitations
 
